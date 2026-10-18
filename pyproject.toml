@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=80.10.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lexframe"
+dynamic = ["version"]
+description = "A toolkit for interpreting LM residual streams in their native semantics"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Jian Gu", email = "jianguda@gmail.com" }]
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.4.1", "torch>=2.10.0", "transformers>=5.0.0"]
+keywords = ["interpretability", "language models", "logit lens", "residual stream", "steering"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.0.3"]
+demo = ["datasets>=4.5.0"]
+
+[project.urls]
+Homepage = "https://github.com/jianguda/lexframe"
+Repository = "https://github.com/jianguda/lexframe"
+Issues = "https://github.com/jianguda/lexframe/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "lexframe.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lexframe = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]
