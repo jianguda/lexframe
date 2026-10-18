@@ -6,7 +6,7 @@ import hashlib
 import math
 import os
 import warnings
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from ._calibrate import Calibration, calibrate, chunks
 from ._model import Model, forward, kl, logprobs, wrap
 
 Text = str | Sequence[str] | torch.Tensor
+Token = int | str
 Layers = int | Iterable[int] | None
 NATIVE = math.inf
 CHECK_TEXT = "The quick brown fox jumps over the lazy dog."
@@ -40,9 +41,11 @@ class Carrier:
     carries and reads them.
 
     vector: the states, [..., position, hidden]; tokens, ids, probs [..., position, k] and kl [..., position]: the
-    frame's reading, as NumPy arrays. basis(), readout() and coef() give the lexical basis, the lexical readout and the
-    coefficients of given tokens at the states of one text. Adding or subtracting a vector moves the states; a moved
-    Carrier is read again with frame.view(), which in the native frame gives the model's own output.
+    frame's reading, as NumPy arrays. first_layer() finds where a token first tops the reading. basis(), readout() and
+    coef() give the lexical basis, the lexical readout and the coefficients of given tokens (ids or single-token
+    strings such as " Paris") at the states of one text. Adding or subtracting a vector moves the states, and steer()
+    moves them along the basis; a moved Carrier is read again with frame.view(), which in the native frame gives the
+    model's own output.
     """
 
     def __init__(self, frame, vector, layers, ids, context, flags, moved=False, reading=None):
@@ -50,20 +53,38 @@ class Carrier:
         self._frame, self._ids, self._context, self._flags = frame, ids, context, flags
         self.ids, self.probs, self.tokens, self.kl = reading or (None, None, None, None)
 
-    def basis(self, tokens: Sequence[int]) -> torch.Tensor:
+    def basis(self, tokens: Sequence[Token]) -> torch.Tensor:
         """The lexical basis of the tokens, [..., position, token, hidden]: the move of the state that the remaining
         layers turn into raising that token alone, scaled to raise its logit by one. Unmoved states only."""
         return self._frame._directions(self, tokens, "basis")
 
-    def readout(self, tokens: Sequence[int]) -> torch.Tensor:
+    def readout(self, tokens: Sequence[Token]) -> torch.Tensor:
         """The lexical readout of the tokens, [..., position, token, hidden]: the gradient of each token's logit, so
         its inner product with a displacement of the state is the logit change it predicts."""
         return self._frame._directions(self, tokens, "readout")
 
-    def coef(self, tokens: Sequence[int]) -> torch.Tensor:
+    def coef(self, tokens: Sequence[Token]) -> torch.Tensor:
         """The coefficients of the state on the tokens, [..., position, token]: their centred logits after the
         transport."""
         return self._frame._directions(self, tokens, "coef")
+
+    def steer(self, weights: Mapping[Token, float]) -> Carrier:
+        """The states moved along the lexical basis of each token by its weight, in logits, at every position, e.g.
+        {" Paris": -4, " London": 4}. Unmoved states of one text only."""
+        tokens = list(weights)
+        b = self.basis(tokens)
+        w = torch.tensor([float(weights[t]) for t in tokens], dtype=b.dtype, device=b.device)
+        return self + (b * w[:, None]).sum(-2)
+
+    def first_layer(self, token: Token) -> np.ndarray:
+        """The first of the read layers at which the token tops the frame's reading, [..., position]; -1 where it
+        never does."""
+        if self.ids is None:
+            raise ValueError("a moved Carrier has no reading; read it with frame.view() first")
+        top = self.ids[..., 0] == self._frame.token_id(token)
+        top = top[..., None, :] if isinstance(self.layers, int) else top
+        layers = np.array(self._layer_list())
+        return np.where(top.any(-2), layers[top.argmax(-2)], -1)
 
     def _layer_list(self) -> list[int]:
         return [self.layers] if isinstance(self.layers, int) else list(self.layers)
@@ -207,8 +228,8 @@ class LexFrame:
         return Carrier(self, vector, layers_, ids, xs, flags, moved, (out[0], out[1], tokens, out[2]))
 
     @torch.no_grad()
-    def attr(self, text: Text, sublayer: str | None = None, target: int | None = None) -> np.ndarray:
-        """How much each layer (or its `sublayer`, "attn" or "mlp") contributed to the logit of the token index
+    def attr(self, text: Text, sublayer: str | None = None, target: Token | None = None) -> np.ndarray:
+        """How much each layer (or its `sublayer`, "attn" or "mlp") contributed to the logit of the token
         `target` (default: the model's own prediction at every position), [layer, position]."""
         if sublayer not in (None, "attn", "mlp"):
             raise ValueError("sublayer is None (the whole layer), 'attn' or 'mlp'")
@@ -217,7 +238,11 @@ class LexFrame:
         hL, xs, mid = forward(self._m, ids, mid=True)
         L = self._m.n_layers
         W = self._m.lm_head.weight.float()
-        top = (self._m.final_norm(hL).float() @ W.T).argmax(-1) if target is None else torch.full_like(ids, int(target))
+        top = (
+            (self._m.final_norm(hL).float() @ W.T).argmax(-1)
+            if target is None
+            else torch.full_like(ids, self.token_id(target))
+        )
         Wd = W[top] - W.mean(0)
         states = xs + [hL]
         written = {
@@ -234,7 +259,7 @@ class LexFrame:
         out = out.transpose(0, 1).cpu().numpy()
         return out[0] if _single(text) else out
 
-    def bound(self, texts: Iterable[Text], token: int, layers: Layers = None) -> np.ndarray:
+    def bound(self, texts: Iterable[Text], token: Token, layers: Layers = None) -> np.ndarray:
         """The best mean cosine that any lens, with one direction per token and layer, can reach with the model's own
         readout of `token`, per layer: sqrt of the readout's agreement across at least two texts. It is a property of
         the model (the native frame), whatever the order of this frame."""
@@ -252,6 +277,18 @@ class LexFrame:
         n = torch.tensor(counts, dtype=torch.float64)
         kappa = ((S.sum(0) ** 2).sum(-1) - (S**2).sum((0, -1))) / (n.sum() ** 2 - (n**2).sum())
         return kappa.clamp_min(0).sqrt().cpu().numpy()
+
+    def token_id(self, token: Token) -> int:
+        """The id of a token, given as an id or as a string that the tokenizer encodes to exactly one token."""
+        if not isinstance(token, str):
+            return int(token)
+        if self._m.tokenizer is None:
+            raise ValueError(f"a token given as the string {token!r} needs the tokenizer")
+        ids = self._m.tokenizer.encode(token, add_special_tokens=False)
+        if len(ids) != 1:
+            pieces = [self._m.tokenizer.decode([i]) for i in ids]
+            raise ValueError(f"{token!r} is {len(ids)} tokens, {pieces}; give a single token or its id")
+        return ids[0]
 
     def _directions(self, x: Carrier, tokens, kind) -> torch.Tensor:
         self._ready()
@@ -275,7 +312,7 @@ class LexFrame:
         T = ids.shape[1]
         one = isinstance(layers, int)
         LS = self._layers(layers)
-        vs = torch.tensor([int(t) for t in tokens], device=self._m.device)
+        vs = torch.tensor([self.token_id(t) for t in tokens], device=self._m.device)
         W = self._m.lm_head.weight.float()
         Wc = W[vs] - W.mean(0)
         Xl = None if X is None else [X[l] for l in LS]

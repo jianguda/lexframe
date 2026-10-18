@@ -7,8 +7,8 @@ import lexframe as lf
 
 frame = lf.LexFrame(model, tokenizer, order=1).init(texts)
 c = frame.view("The Eiffel Tower is located in the city of", k=5, layers=16)
-b, r = c.basis([paris, london]), c.readout([paris, london])
-moved = c + 2 * b[:, 0] - 2 * b[:, 1]
+b, r = c.basis([" Paris", " London"]), c.readout([" Paris", " London"])
+moved = c.steer({" Paris": 2, " London": -2})               # the same as c + 2 * b[:, 0] - 2 * b[:, 1]
 frame.view(moved).tokens
 ```
 
@@ -22,6 +22,7 @@ frame.view(moved).tokens
 | `frame.view(text, k=1, layers=None)` | a `Carrier` at every layer (or the given ones), or the reading of a (moved) `Carrier` |
 | `frame.attr(text, sublayer=None, target=None)` | each layer's (or its `"attn"` or `"mlp"` sublayer's) contribution to the target's logit, `[layer, position]` |
 | `frame.bound(texts, token, layers=None)` | the best agreement any fixed lens can reach, per layer |
+| `frame.token_id(token)` | the id of a token given as an id or as a string of exactly one token |
 
 ## Carrier
 
@@ -30,12 +31,14 @@ frame.view(moved).tokens
 | `vector` | the hidden states, `[..., position, hidden]` |
 | `tokens`, `ids`, `probs` | the top `k` tokens of the frame's reading, `[..., position, k]` |
 | `kl` | the divergence of the reading from the model's output, in nats, `[..., position]` |
+| `first_layer(token)` | the first read layer at which the token tops the reading, `[..., position]`, or -1 |
 | `basis(tokens)` | vectors that move the state to add one logit to each token, `[..., position, token, hidden]` |
 | `readout(tokens)` | covectors that measure each token's logit, so `readout @ basis.mT` has ones on the diagonal |
 | `coef(tokens)` | how much of each token the state holds, its centred logits, `[..., position, token]` |
+| `steer({token: weight})` | a moved `Carrier`, shifted along each token's basis by its weight in logits |
 | `carrier + v`, `carrier - v` | a moved `Carrier`, read again with `frame.view(moved)` |
 
-Layers run from 0, the embedding, to `frame.num_layers`, the output. `view` and `attr` take a list of texts of one token length, which adds a leading axis, and `basis`, `readout` and `coef` take the carrier of one text.
+Tokens are given as ids or as strings that encode to exactly one token, such as `" Paris"`; a string of several tokens is refused. Layers run from 0, the embedding, to `frame.num_layers`, the output. `view` and `attr` take a list of texts of one token length, which adds a leading axis, and `basis`, `readout` and `coef` take the carrier of one text.
 
 ## Notes
 

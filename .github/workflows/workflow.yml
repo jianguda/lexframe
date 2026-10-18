@@ -3,8 +3,16 @@ name: workflow
 on:
   push:
     branches: [main]
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]  # tag pushes ignore the path filter
+    paths: &code
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "MANIFEST.in"
+      - ".github/workflows/**"
   pull_request:
+    paths: *code
+  workflow_dispatch:
 
 jobs:
   test:

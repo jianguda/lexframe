@@ -126,6 +126,39 @@ def test_steering(frame):
     assert with_order(frame, 1).view(moved, k=1).ids.shape == (T, 1)
 
 
+def test_steer(frame):
+    s = frame.view(TEXT, layers=2)
+    b = s.basis([PARIS, LONDON])
+    moved = s.steer({"paris": 2, LONDON: -2})
+    # steer solves the basis again, and an iterative solve repeats only up to rounding
+    d, want = (moved - s).vector, 2 * b[:, 0] - 2 * b[:, 1]
+    assert moved.moved and (d - want).norm() < 1e-2 * want.norm()
+    with pytest.raises(ValueError, match="moved"):
+        moved.steer({"paris": 1})
+
+
+def test_first_layer(frame):
+    v = frame.view(TEXT)
+    token = int(v.ids[-1, -1, 0])
+    first = v.first_layer(token)
+    top = v.ids[..., 0] == token
+    assert first.shape == (T,) and first[-1] == int(np.argmax(top[:, -1])) and v.first_layer("paris").min() >= -1
+    assert (first[~top.any(0)] == -1).all()
+    assert frame.view(TEXT, layers=L).first_layer(token)[-1] == L
+    assert frame.view([TEXT, TEXT]).first_layer(token).shape == (2, T)
+    with pytest.raises(ValueError, match="no reading"):
+        (v + 0).first_layer(token)
+
+
+def test_tokens_as_strings(frame):
+    s = frame.view(TEXT, layers=2)
+    assert torch.equal(s.coef(["paris", "london"]), s.coef([PARIS, LONDON]))
+    assert np.array_equal(frame.attr(TEXT, target="paris"), frame.attr(TEXT, target=PARIS))
+    assert frame.token_id("paris") == frame.token_id(PARIS) == PARIS
+    with pytest.raises(ValueError, match="2 tokens"):
+        s.coef(["paris london"])
+
+
 @pytest.mark.parametrize("sublayer", [None, "attn", "mlp"])
 def test_attr(frame, sublayer):
     a = frame.attr(TEXT, sublayer)

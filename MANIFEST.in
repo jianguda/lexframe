@@ -1,3 +1,4 @@
-include demo.py requirements.txt
+include requirements.txt
+recursive-include examples *.py
 recursive-include docs *.md
 recursive-include tests *.py
