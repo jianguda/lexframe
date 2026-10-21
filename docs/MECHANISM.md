@@ -10,7 +10,7 @@ $$z_v = w_v^\top N(x_L),$$
 
 with the last hidden state $x_L$, the final normalisation $N$ and the unembedding row $w_v$. Its centred logit $c_v$ subtracts the mean over the vocabulary. This output frame is fixed, as every state at the output is read in the same way.
 
-A hidden state $x_\ell$ at an intermediate layer has no fixed frame, because its meaning depends on the layers that remain. Let $J_\ell$ be the Jacobian of the transport of section 2 followed by $N$. Each token then has two directions at the state.
+A hidden state $x_\ell$ at an intermediate layer has no fixed frame, because its meaning depends on the layers that remain. Let $J_\ell$ be the Jacobian of the transport (section 2) followed by $N$. Each token then has two directions at the state.
 
 - The **lexical readout** $b_\ell(v) = J_\ell^\top (w_v - \bar w)$ is the gradient of the token's centred logit, computed by reverse-mode differentiation through the transport. Its inner product with a displacement of the state is the logit change that the displacement causes to first order.
 - The **lexical basis** $s_\ell(v) = J_\ell^{+} s_v$ is the move of the state that raises the token alone, where $s_v = (W^\top W)^{-1} w_v$ is the output basis vector of $v$. It solves the damped least-squares problem
@@ -33,7 +33,7 @@ and their softmax is the reading of the state, a distribution over the next toke
 
 ## 3. Orders of Attention
 
-The order $n$ is the number of rounds of attention between positions that the transport computes, which makes a frame **context-aware**.
+The order $n$ counts the rounds of attention between positions that the transport computes, which makes a frame **context-aware**.
 
 | Order | Attention of the state in each remaining layer | Reads |
 |---|---|---|
@@ -47,6 +47,6 @@ The attention that a frame withholds is replaced by a typical attention output, 
 
 $$\hat a_k(y) = \bar a_k + G_k\, (y - \bar y_k),$$
 
-where $y$ is the attention input, $\bar y_k$ and $\bar a_k$ are the means of the attention input and output of layer $k$, and $G_k$ is the ridge regression of the output on the input. It is estimated in closed form from one forward pass over unlabelled text, with the ridge chosen by two-fold cross-validation. The first position has no prefix and attends only to itself, so its attention output is exact at every order.
+where $y$ is the attention input, $\bar y_k$ and $\bar a_k$ are the mean attention input and output of layer $k$, and $G_k$ is the ridge regression of the output on the input. It has a closed form, estimated from one forward pass over unlabelled text, and its ridge is chosen by two-fold cross-validation. The first position has no prefix and attends only to itself, so its attention output is exact at every order.
 
 Each order adds one round of attention between positions. Two identities follow. The reading of every layer at order `"inf"` equals the model's output, and a frame of order $n$ is exact wherever at most $n$ layers remain.

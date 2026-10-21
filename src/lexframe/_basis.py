@@ -112,19 +112,29 @@ def lsmr(Av, Atu, b, x0, damp, steps):
 
 
 def auto_batch(m, probe, n, cap=64):
-    if m.device.type != "cuda":
+    dev = m.device
+    if dev.type != "cuda":
         return min(n, 8)
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(dev)
     torch.cuda.empty_cache()
-    base = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated(dev)
+    torch.cuda.reset_peak_memory_stats(dev)
     probe(2)
-    per = max(1, (torch.cuda.max_memory_allocated() - base) // 2)
-    free = torch.cuda.get_device_properties(m.device).total_memory - base
-    return max(1, min(n, cap, int(0.8 * free / per)))
+    per = max(1, (torch.cuda.max_memory_allocated(dev) - base) // 2)
+    # what this process may still take: memory free on the device, within its own cap, both net of what it holds
+    limit = torch.cuda.get_device_properties(dev).total_memory * torch.cuda.get_per_process_memory_fraction(dev)
+    free = min(torch.cuda.mem_get_info(dev)[0] + torch.cuda.memory_reserved(dev), limit) - base
+    return max(1, min(n, cap, int(0.8 * max(free, 0) / per)))
 
 
 def basis(m, cal, xs, LS, Y, order=None, ridge=0.001, steps=30, after=None, warm=False):
+    if m.device.type == "cuda":
+        with torch.cuda.device(m.device):
+            return _basis(m, cal, xs, LS, Y, order, ridge, steps, after, warm)
+    return _basis(m, cal, xs, LS, Y, order, ridge, steps, after, warm)
+
+
+def _basis(m, cal, xs, LS, Y, order, ridge, steps, after, warm):
     nr = Y.shape[0]
     LS = sorted(LS, reverse=True)
     X0s = {l: xs[l][:1] for l in LS}

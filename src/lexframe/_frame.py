@@ -45,27 +45,35 @@ class Carrier:
     coef() give the lexical basis, the lexical readout and the coefficients of given tokens (ids or single-token
     strings such as " Paris") at the states of one text. Adding or subtracting a vector moves the states, and steer()
     moves them along the basis; a moved Carrier is read again with frame.view(), which in the native frame gives the
-    model's own output.
+    model's own output. A Carrier of chosen positions only (positions) holds its reading and nothing more.
     """
 
-    def __init__(self, frame, vector, layers, ids, context, flags, moved=False, reading=None):
+    def __init__(self, frame, vector, layers, ids, context, flags, moved=False, reading=None, positions=None):
         self.vector, self.layers, self.moved = vector, layers, moved
         self._frame, self._ids, self._context, self._flags = frame, ids, context, flags
         self.ids, self.probs, self.tokens, self.kl = reading or (None, None, None, None)
+        self.positions = positions
+
+    def _whole(self, what: str) -> None:
+        if self.positions is not None:
+            raise ValueError(f"{what} needs every position: view the text without positions=")
 
     def basis(self, tokens: Sequence[Token]) -> torch.Tensor:
         """The lexical basis of the tokens, [..., position, token, hidden]: the move of the state that the remaining
         layers turn into raising that token alone, scaled to raise its logit by one. Unmoved states only."""
+        self._whole("the basis")
         return self._frame._directions(self, tokens, "basis")
 
     def readout(self, tokens: Sequence[Token]) -> torch.Tensor:
         """The lexical readout of the tokens, [..., position, token, hidden]: the gradient of each token's logit, so
         its inner product with a displacement of the state is the logit change it predicts."""
+        self._whole("the readout")
         return self._frame._directions(self, tokens, "readout")
 
     def coef(self, tokens: Sequence[Token]) -> torch.Tensor:
         """The coefficients of the state on the tokens, [..., position, token]: their centred logits after the
         transport."""
+        self._whole("the coefficient")
         return self._frame._directions(self, tokens, "coef")
 
     def steer(self, weights: Mapping[Token, float]) -> Carrier:
@@ -96,6 +104,7 @@ class Carrier:
         return v[None] if single else v
 
     def _moved(self, other, sign) -> Carrier:
+        self._whole("moving a state")
         d = other.vector if isinstance(other, Carrier) else torch.as_tensor(other)
         v = self.vector + sign * d.to(self.vector)
         return Carrier(self._frame, v, self.layers, self._ids, self._context, self._flags, True)
@@ -110,7 +119,8 @@ class Carrier:
         return self._moved(other, -1)
 
     def __repr__(self) -> str:
-        return f"Carrier(layers={self.layers}, shape={tuple(self.vector.shape)}, moved={self.moved})"
+        extra = "" if self.positions is None else f", positions={self.positions}"
+        return f"Carrier(layers={self.layers}, shape={tuple(self.vector.shape)}, moved={self.moved}{extra})"
 
 
 class LexFrame:
@@ -159,23 +169,17 @@ class LexFrame:
         cache: bool = True,
         cache_dir: str | None = None,
         tol: float = 0.05,
+        progress: bool = True,
     ) -> LexFrame:
         """Calibrate on unlabelled `texts` (`size` sequences of 128 tokens are used) and check the exact identities.
         With cache=True the calibration is stored under a fingerprint of the model's weights and configuration, the
         calibration tokens and the settings, and loaded again when all of them match."""
         batches = _batches(self._m, texts, size)
-        path = None
-        if cache:
-            folder = (
-                cache_dir
-                or os.environ.get("LEXFRAME_CACHE")
-                or os.path.join(os.path.expanduser("~"), ".cache", "lexframe")
-            )
-            path = os.path.join(folder, _fingerprint(self._m, batches) + ".pt")
+        path = os.path.join(_folder(cache_dir), _fingerprint(self._m, batches) + ".pt") if cache else None
         if path and os.path.exists(path):
             cal = Calibration.load(path, self._m)
         else:
-            cal = calibrate(self._m, batches)
+            cal = calibrate(self._m, batches, progress=progress)
             if path:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 cal.save(path)
@@ -186,27 +190,46 @@ class LexFrame:
         return self
 
     @torch.no_grad()
-    def view(self, x: Text | Carrier, k: int = 1, layers: Layers = None) -> Carrier:
+    def view(
+        self,
+        x: Text | Carrier,
+        k: int = 1,
+        layers: Layers = None,
+        positions: int | Iterable[int] | None = None,
+    ) -> Carrier | list[Carrier]:
         """The hidden states of one or more texts at every layer (or the given ones) with what the frame reads in
-        them, or the reading of a (moved) Carrier. In the native frame, a moved Carrier reads as the model's output."""
+        them, or the reading of a (moved) Carrier. In the native frame, a moved Carrier reads as the model's output.
+        positions reads only the given positions of a text, which is cut after the last of them. Texts of different
+        token lengths are read one at a time, and a list of Carriers is returned."""
+        if positions is not None and not _is_int(positions):
+            positions = list(positions)
+        ragged = self._ragged(x)
+        if ragged is not None:
+            return [self.view(t, k, layers, positions) for t in ragged]
         self._ready()
+        P = None
         if isinstance(x, Carrier):
+            if positions is not None:
+                raise ValueError("a Carrier is read as it is: positions apply to texts")
+            if x.positions is not None:
+                raise ValueError("a Carrier of chosen positions holds its reading only: view the text again")
             if x._frame._m.hf is not self._m.hf:
                 raise ValueError("this Carrier comes from another model")
             if layers is not None:
                 raise ValueError("a Carrier is read at its own layers")
-            ids, xs, LS, flags, vector = x._ids, x._context, x._layer_list(), x._flags, x.vector
+            ids, xs, LS, flags = x._ids, x._context, x._layer_list(), x._flags
             V = x._canonical()
             X = [V[:, i].to(xs[l].dtype) for i, l in enumerate(LS)] if x.moved else None
         else:
             ids = self._m.ids(x)
+            if positions is not None:
+                P = self._positions(positions, ids.shape[1])
+                ids = ids[:, : P[-1] + 1]
             hL, xs, _ = forward(self._m, ids)
             xs = xs + [hL]
             LS = self._layers(layers)
             flags = (_single(x), isinstance(layers, int))
-            vector = torch.stack([xs[l] for l in LS], 1).float()
-            vector = vector[0] if flags[0] else vector
-            vector = vector[..., 0, :, :] if flags[1] else vector
+            V = torch.stack([xs[l] for l in LS], 1).float()
             X = None
         H = self._run(xs, LS, X)
         ref = logprobs(self._m, xs[-1])
@@ -217,22 +240,33 @@ class LexFrame:
             torch.stack([kl(ref, logprobs(self._m, h)) for h in H], 1),
         ]
         out = [o.cpu().numpy() for o in out]
+        if P is not None:
+            out = [out[0][:, :, P], out[1][:, :, P], out[2][:, :, P]]
+            V = V[:, :, P]
         if flags[0]:
-            out = [o[0] for o in out]
+            out, V = [o[0] for o in out], V[0]
         if flags[1]:
             out = [out[0][..., 0, :, :], out[1][..., 0, :, :], out[2][..., 0, :]]
+            V = V[..., 0, :, :]
+        vector = x.vector if isinstance(x, Carrier) else V
         tok = self._m.tokenizer
         tokens = None if tok is None else np.vectorize(lambda i: tok.decode([int(i)]), otypes=[object])(out[0])
         moved = x.moved if isinstance(x, Carrier) else False
         layers_ = LS[0] if flags[1] else LS
-        return Carrier(self, vector, layers_, ids, xs, flags, moved, (out[0], out[1], tokens, out[2]))
+        reading = (out[0], out[1], tokens, out[2])
+        return Carrier(self, vector, layers_, ids, xs, flags, moved, reading, P)
 
     @torch.no_grad()
-    def attr(self, text: Text, sublayer: str | None = None, target: Token | None = None) -> np.ndarray:
+    def attr(
+        self, text: Text, sublayer: str | None = None, target: Token | None = None
+    ) -> np.ndarray | list[np.ndarray]:
         """How much each layer (or its `sublayer`, "attn" or "mlp") contributed to the logit of the token
         `target` (default: the model's own prediction at every position), [layer, position]."""
         if sublayer not in (None, "attn", "mlp"):
             raise ValueError("sublayer is None (the whole layer), 'attn' or 'mlp'")
+        ragged = self._ragged(text)
+        if ragged is not None:
+            return [self.attr(t, sublayer, target) for t in ragged]
         self._ready()
         ids = self._m.ids(text)
         hL, xs, mid = forward(self._m, ids, mid=True)
@@ -280,15 +314,7 @@ class LexFrame:
 
     def token_id(self, token: Token) -> int:
         """The id of a token, given as an id or as a string that the tokenizer encodes to exactly one token."""
-        if not isinstance(token, str):
-            return int(token)
-        if self._m.tokenizer is None:
-            raise ValueError(f"a token given as the string {token!r} needs the tokenizer")
-        ids = self._m.tokenizer.encode(token, add_special_tokens=False)
-        if len(ids) != 1:
-            pieces = [self._m.tokenizer.decode([i]) for i in ids]
-            raise ValueError(f"{token!r} is {len(ids)} tokens, {pieces}; give a single token or its id")
-        return ids[0]
+        return token_id(self._m, token)
 
     def _directions(self, x: Carrier, tokens, kind) -> torch.Tensor:
         self._ready()
@@ -388,6 +414,13 @@ class LexFrame:
             raise ValueError("this method takes one text at a time")
         return ids
 
+    def _ragged(self, x) -> list | None:
+        return ragged(self._m, x)
+
+    @staticmethod
+    def _positions(positions, T: int) -> list[int]:
+        return chosen(positions, T)
+
     def _layers(self, layers: Layers) -> list[int]:
         L = self._m.n_layers
         LS = (
@@ -440,6 +473,45 @@ class LexFrame:
         return self._gi
 
 
+def token_id(m: Model, token: Token) -> int:
+    """The id of a token, given as an id or as a string that the tokenizer encodes to exactly one token."""
+    if not isinstance(token, str):
+        return int(token)
+    if m.tokenizer is None:
+        raise ValueError(f"a token given as the string {token!r} needs the tokenizer")
+    ids = m.tokenizer.encode(token, add_special_tokens=False)
+    if len(ids) != 1:
+        pieces = [m.tokenizer.decode([i]) for i in ids]
+        raise ValueError(f"{token!r} is {len(ids)} tokens, {pieces}; give a single token or its id")
+    return ids[0]
+
+
+def ragged(m: Model, x) -> list | None:
+    """The texts of a batch whose token lengths differ, or None."""
+    if not isinstance(x, (list, tuple)) or len(x) < 2 or not all(isinstance(t, str) for t in x):
+        return None
+    if m.tokenizer is None:
+        return None
+    lengths = {len(m.tokenizer.encode(t, add_special_tokens=False)) for t in x}
+    return list(x) if len(lengths) > 1 else None
+
+
+def chosen(positions, T: int) -> list[int]:
+    """Positions given as one index or several, possibly negative, as sorted indices into a text of T tokens."""
+    P = [positions] if _is_int(positions) else list(positions)
+    if not P or any(not -T <= int(p) < T for p in P):
+        raise ValueError(f"positions must lie in -{T}..{T - 1} for a text of {T} tokens")
+    return sorted({int(p) % T for p in P})
+
+
+def _is_int(x) -> bool:
+    return isinstance(x, (int, np.integer)) or (isinstance(x, torch.Tensor) and x.dim() == 0)
+
+
+def _folder(cache_dir: str | None) -> str:
+    return cache_dir or os.environ.get("LEXFRAME_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "lexframe")
+
+
 def _batches(m: Model, texts, size: int) -> list[torch.Tensor]:
     texts = list(texts)
     if texts and isinstance(texts[0], torch.Tensor):
@@ -447,7 +519,7 @@ def _batches(m: Model, texts, size: int) -> list[torch.Tensor]:
     return list(chunks(m, texts, length=128, limit=size))
 
 
-def _fingerprint(m: Model, batches: list[torch.Tensor]) -> str:
+def _fingerprint(m: Model, batches: list[torch.Tensor], shapes: bool = False) -> str:
     h = hashlib.sha256(b"lexframe-calibration-1")
     h.update(m.hf.config.to_json_string(use_diff=False).encode())
     with torch.no_grad():
@@ -455,5 +527,7 @@ def _fingerprint(m: Model, batches: list[torch.Tensor]) -> str:
             t = p.detach().double()
             h.update(f"{name}|{tuple(p.shape)}|{p.dtype}|{float(t.sum()):.15e}|{float(t.square().sum()):.15e}".encode())
     for b in batches:
+        if shapes:
+            h.update(str(tuple(b.shape)).encode())
         h.update(b.cpu().long().numpy().tobytes())
     return h.hexdigest()[:32]

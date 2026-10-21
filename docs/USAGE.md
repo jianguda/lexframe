@@ -17,9 +17,9 @@ frame.view(moved).tokens
 | Command | Returns |
 |---|---|
 | `LexFrame(model, tokenizer, order=1)` | a frame with `order` rounds of attention between positions, where `"inf"` is the native frame |
-| `frame.init(texts, size=256, cache=True, cache_dir=None, tol=0.05)` | the frame, calibrated on `size` sequences of 128 tokens (cached on disk) and checked: `frame.identities` |
+| `frame.init(texts, size=256, cache=True, cache_dir=None, tol=0.05, progress=True)` | the frame, calibrated on `size` sequences of 128 tokens (cached on disk) and checked: `frame.identities` |
 | `frame.config(steps=30, ridge=1e-3, warm=False)` | the frame, with these LSMR settings for the basis: `frame.solver` |
-| `frame.view(text, k=1, layers=None)` | a `Carrier` at every layer (or the given ones), or the reading of a (moved) `Carrier` |
+| `frame.view(text, k=1, layers=None, positions=None)` | a `Carrier` at every layer (or the given ones) and every position (or the given ones), or the reading of a (moved) `Carrier` |
 | `frame.attr(text, sublayer=None, target=None)` | each layer's (or its `"attn"` or `"mlp"` sublayer's) contribution to the target's logit, `[layer, position]` |
 | `frame.bound(texts, token, layers=None)` | the best agreement any fixed lens can reach, per layer |
 | `frame.token_id(token)` | the id of a token given as an id or as a string of exactly one token |
@@ -36,9 +36,10 @@ frame.view(moved).tokens
 | `readout(tokens)` | covectors that measure each token's logit, so `readout @ basis.mT` has ones on the diagonal |
 | `coef(tokens)` | how much of each token the state holds, its centred logits, `[..., position, token]` |
 | `steer({token: weight})` | a moved `Carrier`, shifted along each token's basis by its weight in logits |
+| `positions` | the positions that the `Carrier` holds, or `None` for every position |
 | `carrier + v`, `carrier - v` | a moved `Carrier`, read again with `frame.view(moved)` |
 
-Tokens are given as ids or as strings that encode to exactly one token, such as `" Paris"`; a string of several tokens is refused. Layers run from 0, the embedding, to `frame.num_layers`, the output. `view` and `attr` take a list of texts of one token length, which adds a leading axis, and `basis`, `readout` and `coef` take the carrier of one text.
+Tokens are given as ids or as strings that encode to exactly one token, such as `" Paris"`; a string of several tokens is refused. Layers run from 0, the embedding, to `frame.num_layers`, the output. `view` and `attr` take a list of texts: texts of one token length are read together, which adds a leading axis, and texts of different lengths one at a time, which returns a list. `basis`, `readout` and `coef` take the carrier of one text.
 
 ## Notes
 
@@ -50,6 +51,8 @@ Tokens are given as ids or as strings that encode to exactly one token, such as 
 
 **Attribution.** `attr` removes what a layer, or its attention or feed-forward sublayer, wrote from the state that follows it, transports both states and returns the difference of their coefficients on the target, by default the model's own prediction. A linear attribution is `readout @ write` instead.
 
+**Positions.** `positions` reads only the given positions of a text, and of each text in a list. As the model is causal, the text is cut after the last of them, which saves the computation of the later positions. Such a `Carrier` holds its reading only, so take directions or steer on a view of every position.
+
 **Bound.** `bound` measures how much the native frame's readouts of a token agree across at least two texts. Its square root is the best mean cosine that any lens with fixed directions per layer can reach, whatever the order of the frame.
 
-**Cost.** Reading the states of one layer at order $n$ runs $n + 1$ streams through the remaining layers, so `view` over every layer of a text costs about $(n + 1)(L + 1)/2$ forward passes. `readout` adds one backward pass per token, and `basis` one forward-mode and one reverse-mode pass per solver step and layer.
+**Cost.** Reading the states of one layer at order $n$ runs $n + 1$ streams through the remaining layers, so `view` over every layer of a text costs about $(n + 1)(L + 1)/2$ forward passes; `layers=` reads fewer layers at a lower cost. `readout` adds one backward pass per token, and `basis` one forward-mode and one reverse-mode pass per solver step and layer.

@@ -11,7 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Jian Gu", email = "jianguda@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = ["numpy>=2.4.1", "torch>=2.10.0", "transformers>=5.0.0"]
+dependencies = ["numpy>=2.4.1", "torch>=2.10.0", "tqdm>=4.66", "transformers>=5.0.0"]
 keywords = ["interpretability", "language models", "logit lens", "residual stream", "steering"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

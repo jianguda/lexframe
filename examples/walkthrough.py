@@ -16,44 +16,44 @@ native = lf.LexFrame(model, tokenizer, order="inf").init(texts, size=256)  # the
 print(frame, frame.identities, frame.num_layers)
 
 text = "The Eiffel Tower is located in the city of"
-twin = "The Eiffel Tower is found in the city of"
-paris, london = (tokenizer.encode(t, add_special_tokens=False)[0] for t in (" Paris", " London"))
+answer, rival = " Paris", " London"
 
 # 1. Where does the answer appear? A Carrier holds the hidden states and what the frame reads in them.
 v = frame.view(text, k=3)
 for layer in v.layers:
     print(layer, v.tokens[layer, -1], v.probs[layer, -1].round(2), v.kl[layer, -1].round(2))
-decided = next((l for l in range(frame.num_layers - 1) if v.ids[l, -1, 0] == paris), frame.num_layers - 2)
-s = frame.view(text, layers=decided)
-print("decided at layer", decided, s.tokens[-1], s.vector.shape)
-print("batch", frame.view([text, twin]).kl.shape, "model", native.view(text).kl.max())
+decided = int(v.first_layer(answer)[-1])
+decided = decided if 0 <= decided < frame.num_layers else frame.num_layers // 2
+print("the answer tops the reading from layer", decided)
+at = max(decided, frame.num_layers // 2)  # from mid-depth on, the frame predicts the effect of a steer well
+print("last position only", frame.view(text, k=3, positions=-1).tokens[:, 0, 0])
+print("texts of any length", [c.kl.shape for c in frame.view([text, "The Louvre is in"])])
 
 # 2. Who wrote it? Each layer's contribution to the logit of the answer, then split into its sublayers.
-whole = frame.attr(text, target=paris)[:, -1]
+whole = frame.attr(text, target=answer)[:, -1]
 top = whole.argsort()[::-1][:3]
-attn = frame.attr(text, "attn", target=paris)[top, -1]
-mlp = frame.attr(text, "mlp", target=paris)[top, -1]
+attn = frame.attr(text, "attn", target=answer)[top, -1]
+mlp = frame.attr(text, "mlp", target=answer)[top, -1]
 print("layers", top, "whole", whole[top].round(2), "attn", attn.round(2), "mlp", mlp.round(2))
-print("batch", frame.attr([text, twin]).shape)
 
-# 3. How far can any fixed lens go?
-prompts = ["The Louvre is a museum in the city of", "The Seine flows through the city of"]
-print("bound", frame.bound(prompts, paris).round(2), frame.bound(prompts, paris, layers=[decided]).round(2))
+# 3. How far can any fixed lens go? The bound is the best mean cosine with the model's readouts.
+prompts = ["The Louvre is a museum in the city of", "The Seine flows through the city of", text]
+print("bound", frame.bound(prompts, answer).round(2))
 
-# 4. The coordinates of the state at the deciding layer: its basis, readout and coefficients.
-b, o = s.basis([paris, london]), s.readout([paris, london])
-print("coef", s.coef([paris, london])[-1], "duality", (o @ b.mT)[-1])
-nxt = frame.view(text, layers=decided + 1)
-print("written by the layer", (nxt.readout([paris, london]) @ (nxt.vector - s.vector)[..., None])[-1, :, 0])
-print("every layer", v.coef([paris, london]).shape)
+# 4. The coordinates of the state at mid-depth or later: its basis, readout and coefficients.
+s = frame.view(text, layers=at)
+b, o = s.basis([answer, rival]), s.readout([answer, rival])
+print("coef", s.coef([answer, rival])[-1], "duality", (o @ b.mT)[-1])
+nxt = frame.view(text, layers=at + 1)
+print("written by the layer", (nxt.readout([answer, rival]) @ (nxt.vector - s.vector)[..., None])[-1, :, 0])
 
-# 5. Change its mind: move the state and read it again; the native frame reads the model's own output.
-moved = s - 4 * b[:, 0] + 4 * b[:, 1]
-actual = native.view(moved).coef([paris, london]) - native.view(s).coef([paris, london])
+# 5. Change its mind: steer the state along the basis and read it again; the native frame gives the model's output.
+moved = s.steer({answer: -4, rival: 4})
+actual = native.view(moved).coef([answer, rival]) - native.view(s).coef([answer, rival])
 print(moved, "predicted", (o @ (moved - s).vector[..., None])[-1, :, 0], "actual", actual[-1])
 print("model", native.view(moved).tokens[-1], "frame", frame.view(moved).tokens[-1])
 
 # 6. Other orders and the solver.
 print("order 0", lf.LexFrame(model, tokenizer, order=0).init(texts, size=256).view(text).kl.mean())
 frame.config(steps=100, ridge=1e-3, warm=True)
-print(frame.solver, "duality", (o @ frame.view(s).basis([paris, london]).mT)[-1])
+print(frame.solver, "duality", (o @ frame.view(s).basis([answer, rival]).mT)[-1])

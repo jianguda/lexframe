@@ -13,7 +13,7 @@ RHO = [10 ** (e / 8) for e in range(-56, 25)]
 
 class _Moments:
 
-    def __init__(self, m: Model, batches: Iterable[torch.Tensor], folds: int = 2, work=torch.float32):
+    def __init__(self, m: Model, batches: Iterable[torch.Tensor], folds: int = 2, work=torch.float32, progress=False):
         L, d = m.n_layers, m.hidden_dim
         self.L, self.d, self.K, self.dev = L, d, folds, m.device
         self.n = 0
@@ -46,7 +46,9 @@ class _Moments:
                 if k == L - 1:
                     self.cnt[f] = n1 + n2
 
-        for ids in batches:
+        from tqdm.auto import tqdm
+
+        for ids in tqdm(batches, desc="Calibration", disable=not progress, leave=False):
             ids = m.ids(ids)
             forward(m, ids, on_attention=cap)
             at[0] += ids.shape[0]
@@ -187,8 +189,8 @@ def chunks(m: Model, texts: Iterable[str], length: int = 128, batch: int = 8, li
 
 
 @torch.no_grad()
-def calibrate(m: Model, batches: Iterable, folds: int = 2, work=torch.float32) -> Calibration:
-    bank = _Moments(m, batches, folds, work)
+def calibrate(m: Model, batches: Iterable, folds: int = 2, work=torch.float32, progress: bool = False) -> Calibration:
+    bank = _Moments(m, batches, folds, work, progress)
     L, d, dev, K = bank.L, bank.d, bank.dev, bank.K
     f64 = torch.float64
     store = "cpu" if L * d * d * 8 > 1500000000.0 else dev

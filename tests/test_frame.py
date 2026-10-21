@@ -208,3 +208,36 @@ def test_config_the_solver(frame):
     for bad in ({"steps": 0}, {"steps": 2.5}, {"ridge": -1.0}):
         with pytest.raises(ValueError):
             f.config(**bad)
+
+
+def test_positions(frame):
+    whole = frame.view(TEXT, k=2)
+    last = frame.view(TEXT, k=2, positions=-1)
+    assert last.positions == [T - 1] and np.array_equal(last.ids[:, 0], whole.ids[:, -1])
+    assert np.allclose(last.kl[:, 0], whole.kl[:, -1], atol=1e-5) and last.vector.shape[-2] == 1
+    two = frame.view(TEXT, positions=[2, 0], layers=1)
+    assert two.positions == [0, 2] and np.allclose(two.kl, whole.kl[1, [0, 2]], atol=1e-5)
+    with pytest.raises(ValueError, match="every position"):
+        last.steer({"paris": 1})
+    with pytest.raises(ValueError, match="view the text again"):
+        frame.view(last)
+    with pytest.raises(ValueError, match="positions must lie"):
+        frame.view(TEXT, positions=T)
+
+
+def test_texts_of_different_lengths(frame):
+    short = "the city of"
+    vs = frame.view([TEXT, short], k=2)
+    assert isinstance(vs, list) and [v.ids.shape[1] for v in vs] == [T, 3]
+    assert np.array_equal(vs[1].ids, frame.view(short, k=2).ids)
+    a = frame.attr([TEXT, short])
+    assert isinstance(a, list) and a[1].shape == (L, 3) and np.allclose(a[1], frame.attr(short))
+    assert frame.view([TEXT, TEXT]).kl.shape == (2, L + 1, T)
+
+
+def test_positions_given_in_any_form(frame):
+    short = "the city of"
+    vs = frame.view([TEXT, short], positions=(p for p in [-1]))
+    assert [v.positions for v in vs] == [[T - 1], [2]]
+    assert frame.view(TEXT, positions=np.int64(-1)).positions == [T - 1]
+    assert frame.view(TEXT, positions=torch.tensor(0)).positions == [0]

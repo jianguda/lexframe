@@ -13,7 +13,7 @@
 
 LexFrame reads a hidden state the way the model reads it, in the model's own vocabulary.
 It is **model-native**: the state is transported layer by layer through the model's own remaining layers, with nothing fitted to the output.
-It is **context-aware**: along the way the state attends to its prefix, for a chosen number of rounds of attention.
+It is **context-aware**: along the way the state attends to its prefix, for as many rounds as chosen.
 
 ## Quickstart
 
@@ -34,15 +34,19 @@ c = frame.view(text, layers=16)
 frame.view(c.steer({" Paris": -4, " London": 4})).tokens     # steer: move layer 16 from Paris toward London
 ```
 
-[docs/USAGE.md](https://github.com/jianguda/lexframe/blob/main/docs/USAGE.md) lists every command, and [examples/walkthrough.py](https://github.com/jianguda/lexframe/blob/main/examples/walkthrough.py) puts them to work: where SmolLM3 decides that the Eiffel Tower is in Paris, who wrote that decision, and how to change it. [examples/visualize.py](https://github.com/jianguda/lexframe/blob/main/examples/visualize.py) plots every layer's reading and where the state sits among the lexical bases, layer by layer.
+[docs/USAGE.md](https://github.com/jianguda/lexframe/blob/main/docs/USAGE.md) lists every command, and [examples/walkthrough.py](https://github.com/jianguda/lexframe/blob/main/examples/walkthrough.py) puts them to work: where SmolLM3 decides that the Eiffel Tower is in Paris, who wrote that decision, and how to change it. [examples/visualize.py](https://github.com/jianguda/lexframe/blob/main/examples/visualize.py) plots every layer's reading and where the state sits among the lexical bases, layer by layer. To try LexFrame without installing anything, [open the quickstart in Colab](https://colab.research.google.com/github/jianguda/lexframe/blob/main/examples/quickstart.ipynb).
 
 ## Mechanism
 
-Lenses such as the logit lens and the Jacobian lens read every hidden state of a layer through one fixed frame, so they share a ceiling, and in middle layers they often miss what the model already knows. A frame instead transports a hidden state through the model's own remaining layers, with the context the state attends to, and reads the result in lexical semantics, over the model's own vocabulary. In this frame, predictions can be read, attributed and steered at every layer. [docs/MECHANISM.md](https://github.com/jianguda/lexframe/blob/main/docs/MECHANISM.md) explains the details, and the [blog post](https://jianguda.github.io/blogs/lexframe/) explains why this frame matters.
+Lenses such as the logit lens and the Jacobian lens read every hidden state of a layer with one fixed map, whatever the context, so they share a ceiling and, everywhere except near the output, often miss what the model already knows. LexFrame instead carries each hidden state and its context through the model's remaining layers and reads the result over the vocabulary, as the model reads it. These readings can be attributed and steered at every layer. [docs/MECHANISM.md](https://github.com/jianguda/lexframe/blob/main/docs/MECHANISM.md) explains the details.
+
+<p align="center"><img src="https://raw.githubusercontent.com/jianguda/lexframe/main/assets/lenses-qwen.png" width="900" alt="The top token each method reads in Qwen3-0.6B"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/jianguda/lexframe/main/assets/lenses-minicpm.png" width="900" alt="The top token each method reads in MiniCPM5-1B"></p>
+<p align="center"><sub>The top token that each method reads at every second layer of Qwen3-0.6B (top) and MiniCPM5-1B (bottom), shaded by its probability, with the Jacobian lens fitted on 100 sequences. At the last position, LexFrame reads " Paris" from layer 2 in Qwen3-0.6B and from layer 0 in MiniCPM5-1B, while both lenses read it only from layer 18 or later.</sub></p>
 
 ## Compatibility
 
-LexFrame supports the same causal language models as 🤗 Transformers, including popular model families such as `Llama`, `Qwen`, `Gemma`, `Mistral` and `DeepSeek`.
+LexFrame supports the same causal language models as 🤗 Transformers, including popular model families such as `Llama`, `Qwen`, `Gemma`, `Mistral` and `DeepSeek`, and compact or fully open ones such as `Phi`, `OLMo` and `MiniCPM`.
 
 ## Citation
 
