@@ -1,4 +1,4 @@
-"""The lexical basis at a layer, s = J^+ y, solved by LSMR on Jacobian-vector products without forming J."""
+"""The lexical basis at a layer in the native frame, s = J^+ y, solved by LSMR on Jacobian-vector products without forming J."""
 
 import math
 
@@ -10,30 +10,9 @@ from . import _transport as TR
 from ._model import block, innorm
 
 
-def references(m, cal, xs, l, order):
-    L = int(m.n_layers)
-    B, Tn, d = xs[0].shape
-    fi = torch.arange(0, B * Tn, Tn, device=xs[0].device)
-    if order is None:
-        return [innorm(m, k)(xs[k]) for k in range(l, L)]
-    low = [xs[l]] * order
-    out = []
-    with torch.no_grad():
-        for k in range(l, L):
-            norm = innorm(m, k)
-            refs = [norm(h) for h in low]
-            out.append(refs[order - 1])
-            att = [TR.attend(m, k, refs[j], refs[j - 1]) for j in range(1, order)]
-            new = [TR._step(m, cal, k, low[0].reshape(-1, d), fi).view(B, Tn, d)]
-            for j in range(1, order):
-                a = att[j - 1].reshape(-1, d)
-                new.append(
-                    block(m, k, low[j].reshape(-1, d), lambda u, s, a=a: a[s : s + u.shape[0]].to(u.dtype)).view(
-                        B, Tn, d
-                    )
-                )
-            low = new
-    return out
+def references(m, xs, l):
+    """The true attention inputs of every position at layers l..L-1, which the transported states attend to."""
+    return [innorm(m, k)(xs[k]) for k in range(l, int(m.n_layers))]
 
 
 def stream(m, l, refs, X, ckpt=False):
@@ -127,19 +106,19 @@ def auto_batch(m, probe, n, cap=64):
     return max(1, min(n, cap, int(0.8 * max(free, 0) / per)))
 
 
-def basis(m, cal, xs, LS, Y, order=None, ridge=0.001, steps=30, after=None, warm=False):
+def basis(m, xs, LS, Y, ridge=0.001, steps=30, after=None, warm=False):
     if m.device.type == "cuda":
         with torch.cuda.device(m.device):
-            return _basis(m, cal, xs, LS, Y, order, ridge, steps, after, warm)
-    return _basis(m, cal, xs, LS, Y, order, ridge, steps, after, warm)
+            return _basis(m, xs, LS, Y, ridge, steps, after, warm)
+    return _basis(m, xs, LS, Y, ridge, steps, after, warm)
 
 
-def _basis(m, cal, xs, LS, Y, order, ridge, steps, after, warm):
+def _basis(m, xs, LS, Y, ridge, steps, after, warm):
     nr = Y.shape[0]
     LS = sorted(LS, reverse=True)
     X0s = {l: xs[l][:1] for l in LS}
-    K0 = references(m, cal, xs, min(LS), None) if order is None else None
-    kvof = lambda l: K0[l - min(LS) :] if order is None else references(m, cal, xs, l, order)
+    K0 = references(m, xs, min(LS))
+    kvof = lambda l: K0[l - min(LS) :]
 
     def run(rows, l, x0, kv):
         X0 = X0s[l]

@@ -2,51 +2,77 @@
 
 How LexFrame reads a hidden state. The notation follows the paper.
 
+LexFrame answers three questions about the state $x_k(t)$ at layer $k$ and position $t$, each with its own tool:
+
+| Question | Tool | Method |
+|---|---|---|
+| What does the state carry? | the closure reading $R_k$ | `view()` |
+| What does the context add after layer $k$? | the ledger | `ledger()` |
+| How does the model use the state here? | the native frame: readout, basis, coefficients | `readout()`, `basis()`, `coef()`, `steer()`, `attr()` |
+
+Layers run from 1 to $L$. Layer 0 is the embedding, a fixed input frame, and is shown for diagnosis only.
+
 ## 1. Native semantics
 
 A language model's vocabulary is its native semantics. At the output, the logit of a token $v$ is
 
 $$z_v = w_v^\top N(x_L),$$
 
-with the last hidden state $x_L$, the final normalisation $N$ and the unembedding row $w_v$. Its centred logit $c_v$ subtracts the mean over the vocabulary. This output frame is fixed, as every state at the output is read in the same way.
+with the last hidden state $x_L$, the final normalisation $N$ and the unembedding row $w_v$. Its centred logit $c_v$ subtracts the mean over the vocabulary. Every state at the output is read in this one way. A state at an intermediate layer has no fixed reading, because what it means depends on the layers that remain.
 
-A hidden state $x_\ell$ at an intermediate layer has no fixed frame, because its meaning depends on the layers that remain. Let $J_\ell$ be the Jacobian of the transport (section 2) followed by $N$. Each token then has two directions at the state.
+## 2. The closure reading
 
-- The **lexical readout** $b_\ell(v) = J_\ell^\top (w_v - \bar w)$ is the gradient of the token's centred logit, computed by reverse-mode differentiation through the transport. Its inner product with a displacement of the state is the logit change that the displacement causes to first order.
-- The **lexical basis** $s_\ell(v) = J_\ell^{+} s_v$ is the move of the state that raises the token alone, where $s_v = (W^\top W)^{-1} w_v$ is the output basis vector of $v$. It solves the damped least-squares problem
-  $$\min_\delta \lVert J_\ell \delta - s_v \rVert^2 + \lambda \lVert \delta \rVert^2, \qquad \lambda = \rho\, \lVert J_\ell^\top s_v \rVert^2 / \lVert s_v \rVert^2,$$
-  by LSMR, with forward-mode products $J_\ell \delta$ and reverse-mode products $J_\ell^\top y$ and without forming $J_\ell$. The relative ridge $\rho$ damps the directions that the remaining layers barely pass on, and each solution is scaled so that one unit adds exactly one logit.
+The closure reads $x_k(t)$ by running it through the model's own layers $k+1, \dots, L$ on its own column. Norms, feed-forward blocks and residual connections are computed as the model computes them. Other positions enter a layer only through its attention write, so the closure replaces each write by its prediction from the column's own attention input $u$, plus an independent Gaussian innovation:
 
-Both change with the layer and with the context, and the readout and basis of a token have an inner product of one.
+$$a_\ell = \bar a_\ell + G_\ell\,(u - \bar u_\ell) + o_\ell[\beta(t)] + \varepsilon_\ell, \qquad \varepsilon_\ell \sim \mathcal N(0, \Sigma_\ell).$$
 
-## 2. Native transport
+The reading is the mean next-token distribution over the innovations,
 
-A frame reads $x_\ell(t)$, the state at layer $\ell$ and position $t$, by carrying it through the model's own remaining layers to the output. Every layer updates the state from the state one layer below and from its attention output, which brings in the context. The frame keeps the first input exactly, through each layer's own residual connections, normalisations and feed-forward block, and differs from the model only in the attention. Nothing is fitted to the model's output, which makes the frame **model-native**.
+$$R_k = \mathbb E_\varepsilon\big[\mathrm{softmax}(W N(h_L))\big].$$
 
-The attention is computed by the layer's own attention module. The module receives the prefix states followed by the transported states, with an additive mask, so that a transported state at position $t$ sees the prefix positions before $t$ and its own key and nothing else. The position embeddings come from the model itself, from a forward pass with the matching position ids, so they take whatever form the architecture uses.
+After layer $k$ the column never reads another position. There is no reference context and no order to choose, and attention never runs on a context with parts missing. The reading is a function of $x_k(t)$ alone, given the model and the calibration, which the swap test checks exactly: a state carried into another text reads the same. At the output, $R_L$ is the model's own distribution. Elsewhere it is not, so the reading is not a tautology. Position 0 attends only to itself, so its writes are computed exactly and its reading equals the output at every layer.
 
-After the transport $T_\ell$, the model's own inner product gives the coefficients of the state, its logits
+**Calibration.** One forward pass over unlabelled text gives, per layer, the typical attention output: $G_\ell$ is the ridge regression of the write on its input, $\bar u_\ell$ and $\bar a_\ell$ are the means. The ridge is the MacKay evidence fixed point, a closed form without a data split, started from two-fold cross-validation. A second pass gives the residuals of this prediction, excluding position 0, which is exact:
 
-$$z_\ell(v) = \langle w_v,\, N(T_\ell(x_\ell(t))) \rangle,$$
+- the offsets $o_\ell[\beta]$ are the mean residual in each position bucket $\beta(t)$: positions 0 to 7 one each, then buckets of doubling width;
+- $\Sigma_\ell$ is the posterior-predictive covariance, the pooled residual covariance times $n/(n-\gamma_\ell)$, where $\gamma_\ell$ is the effective number of parameters of the regression.
 
-and their softmax is the reading of the state, a distribution over the next token. `coef()` returns them centred by their mean over the vocabulary, which leaves the reading unchanged.
+The calibration is part of the reading's definition, a prior over contexts. `init()` takes 1024 blocks of 128 tokens, one from each of 1024 evenly spaced texts (WikiText-103 in the paper), cut by the same pipeline that cuts the texts it reads.
 
-## 3. Orders of Attention
+**Integration.** The expectation is computed by randomised quasi-Monte Carlo. The points are scrambled Sobol points on the eigen-coordinates of every $\Sigma_\ell$, with the largest variances first. By default there are 64. The same points serve every layer, position and text, so a reading is deterministic, and the readings of different layers are paired.
 
-The order $n$ counts the rounds of attention between positions that the transport computes, which makes a frame **context-aware**.
+## 3. The ledger
 
-| Order | Attention of the state in each remaining layer | Reads |
-|---|---|---|
-| 0 | a typical attention output | what the state holds by itself |
-| 1 | the layer's own attention over the prefix, transported at order 0 | what the state draws from its prefix |
-| 2 | the layer's own attention over a prefix transported at order 1 | one exchange among the prefix positions as well |
-| $n$ | the layer's own attention over a prefix transported at order $n-1$ | $n$ rounds of exchange between positions |
-| `"inf"` | the layer's own attention over the true prefix states | the model's own output |
+The closure readings of one position telescope to the output:
 
-The attention that a frame withholds is replaced by a typical attention output, one linear map per layer,
+$$\log p_L(v) - \log R_k(v) = \sum_{j \ge k} \big(\log R_{j+1}(v) - \log R_j(v)\big).$$
 
-$$\hat a_k(y) = \bar a_k + G_k\, (y - \bar y_k),$$
+The sum is exact, because every term uses the same integration points. Step $j$ replaces layer $j$'s closure write, its prediction plus the innovation, by the true write $a_j$. The step splits into two terms:
 
-where $y$ is the attention input, $\bar y_k$ and $\bar a_k$ are the mean attention input and output of layer $k$, and $G_k$ is the ridge regression of the output on the input. It has a closed form, estimated from one forward pass over unlabelled text, and its ridge is chosen by two-fold cross-validation. The first position has no prefix and attends only to itself, so its attention output is exact at every order.
+- the **innovation** of the true write over its prediction;
+- a **noise** term: the closure's own spread at layer $j$, which the true write removes.
 
-Each order adds one round of attention between positions. Two identities follow. The reading of every layer at order `"inf"` equals the model's output, and a frame of order $n$ is exact wherever at most $n$ layers remain.
+The true write is a sum over source positions, $a_j(t) = \sum_s c_s$, where $c_s$ is what the heads read at $s$, weighted by their attention. Since the head-averaged attention weights $w_s$ sum to one, the innovation splits exactly by source position,
+
+$$a_j - \hat a_j = \sum_s (c_s - w_s \hat a_j).$$
+
+Each source term is mapped to the target's log reading by integrated gradients along the straight path from $\hat a_j$ to $a_j$. `ledger()` reports every term in log-probability units and the readings themselves as probabilities. Integrated gradients leave a small discretisation residual, which is reported as well.
+
+## 4. The native frame
+
+The native frame carries the state through the model's remaining layers with the true context. Each position attends to the true states of its prefix and to its own key, through the layer's own attention module and the model's own position embeddings. For an unmoved state this reproduces the model exactly. For a moved state it gives the model's output after the move. Let $J_k$ be the Jacobian of this transport followed by $N$. Each token then has two directions at the state:
+
+- The **lexical readout** $b_k(v) = J_k^\top (w_v - \bar w)$ is the gradient of the token's centred logit. Its inner product with a displacement of the state is the logit change that the displacement causes, to first order.
+- The **lexical basis** $s_k(v) = J_k^{+} s_v$ is the move of the state that raises the token alone, where $s_v = (W^\top W)^{-1} w_v$ is the output basis vector of $v$. It solves the damped least-squares problem
+  $$\min_\delta \lVert J_k \delta - s_v \rVert^2 + \lambda \lVert \delta \rVert^2, \qquad \lambda = \rho\, \lVert J_k^\top s_v \rVert^2 / \lVert s_v \rVert^2,$$
+  by LSMR, with forward-mode products $J_k \delta$ and reverse-mode products $J_k^\top y$ and without forming $J_k$. Each solution is scaled so that one unit adds exactly one logit.
+
+The readout and basis of a token have an inner product of one. Attribution, steering and every other edit use the native frame. Edits along closure directions do not transfer better across paraphrases.
+
+**The closure readout and the frame gap.** The gradient of the centred log reading, $\nabla_x \log R_k(v)$, is the closure readout. It is defined on the readout side only. The frame gap
+
+$$1 - \cos\big(b_k(v),\ \nabla_x \log R_k(v)\big)$$
+
+measures how much the context will still reinterpret the state. Fixed lenses fall short of both directions. The logit lens, the Jacobian lens and the best fixed lens (at most $\sqrt\kappa$, see `bound()`) agree with the native readout less than the closure readout does.
+
+**Attribution.** `attr()` removes what a layer, or its attention or feed-forward sublayer, wrote at a position. It carries both states through the native frame and returns the change of the target's centred logit.

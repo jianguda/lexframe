@@ -1,4 +1,9 @@
-"""The typical attention output of every block: a ridge regression of the attention output on its input."""
+"""The calibration of a frame, from one pass of the model over unlabelled text and a second for the residuals.
+
+Per layer: the typical attention output, a ridge regression of the attention output on its input, with the ridge chosen by the
+MacKay evidence fixed point (started from two-fold cross-validation); and the closure statistics of its residuals, the mean residual
+per position bucket and the posterior-predictive residual covariance (the pooled covariance times n / (n - gamma), with gamma the
+effective number of parameters). Position 0 attends only to itself and is left out of the residuals."""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ from typing import Iterable
 
 import torch
 
+from ._closure import NB, bucket
 from ._model import Model, forward
 
 RHO = [10 ** (e / 8) for e in range(-56, 25)]
@@ -90,18 +96,16 @@ def _merge(ms):
 
 
 class Calibration:
+    """Per layer k: the typical attention output (ubar, abar, the eigenvectors Q and eigenvalues lam of the input covariance, the
+    projected cross-covariance QA and the ridge rho), and the closure statistics (the offsets off [bucket, hidden] and a square root
+    fac of the innovation covariance, fac fac^T = Sigma)."""
 
-    def __init__(self, ubar, abar, Q, lam, QA, rho, stats, model_id):
-        self.ubar, self.abar, self.Q, self.lam, self.QA, self.rho, self.stats, self.model_id = (
-            ubar,
-            abar,
-            Q,
-            lam,
-            QA,
-            rho,
-            stats,
-            model_id,
-        )
+    FIELDS = ("ubar", "abar", "Q", "lam", "QA", "rho", "off", "fac", "count")
+
+    def __init__(self, ubar, abar, Q, lam, QA, rho, off, fac, count, stats, model_id):
+        self.ubar, self.abar, self.Q, self.lam, self.QA, self.rho = ubar, abar, Q, lam, QA, rho
+        self.off, self.fac, self.count = off, fac, count
+        self.stats, self.model_id = stats, model_id
 
     def __repr__(self) -> str:
         return f"Calibration(model={self.model_id['architecture']}, layers={self.model_id['layers']})"
@@ -118,25 +122,18 @@ class Calibration:
         return fn
 
     def to(self, device):
-        mv = lambda t: t.to(device)
-        return Calibration(
-            mv(self.ubar),
-            mv(self.abar),
-            self.Q if self.Q.device.type == "cpu" else mv(self.Q),
-            mv(self.lam),
-            self.QA if self.QA.device.type == "cpu" else mv(self.QA),
-            mv(self.rho),
-            self.stats,
-            self.model_id,
-        )
+        big = lambda t: t if t.device.type == "cpu" else t.to(device)  # large tables stay where calibrate() put them
+        f = {k: getattr(self, k) for k in self.FIELDS}
+        f = {k: (big(v) if k in ("Q", "QA", "fac") else v if k == "count" else v.to(device)) for k, v in f.items()}
+        return Calibration(**f, stats=self.stats, model_id=self.model_id)
 
     def save(self, path: str) -> None:
         torch.save(
             {
-                "format": 1,
+                "format": 2,
                 "model_id": self.model_id,
                 "stats": self.stats,
-                **{k: getattr(self, k).cpu() for k in ("ubar", "abar", "Q", "lam", "QA", "rho")},
+                **{k: getattr(self, k).cpu() for k in self.FIELDS},
             },
             path,
         )
@@ -144,9 +141,9 @@ class Calibration:
     @staticmethod
     def load(path: str, model: Model | None = None) -> Calibration:
         z = torch.load(path, map_location="cpu", weights_only=True)
-        if z.get("format") != 1:
-            raise ValueError(f"{path}: not a lexframe calibration")
-        c = Calibration(z["ubar"], z["abar"], z["Q"], z["lam"], z["QA"], z["rho"], z["stats"], z["model_id"])
+        if z.get("format") != 2:
+            raise ValueError(f"{path}: not a lexframe calibration of format 2 (lexframe 1.3 or later)")
+        c = Calibration(**{k: z[k] for k in Calibration.FIELDS}, stats=z["stats"], model_id=z["model_id"])
         if model is not None:
             if c.model_id != model_id(model):
                 raise ValueError(f"{path} was calibrated for {c.model_id}, not for {model_id(model)}")
@@ -188,8 +185,73 @@ def chunks(m: Model, texts: Iterable[str], length: int = 128, batch: int = 8, li
         yield torch.tensor(out)
 
 
+def spread(m: Model, texts: list, size: int, length: int = 128, window: int = 400) -> list[torch.Tensor]:
+    """`size` blocks of `length` tokens, one starting at each of `size` evenly spaced texts (documents joined by EOS, as in
+    chunks()), in batches of 8; contiguous chunks when there are fewer texts than blocks."""
+    texts = [t for t in texts if t and t.strip()]
+    if len(texts) < size:
+        return list(chunks(m, texts, length=length, limit=size))
+    out = []
+    for j in range(size):
+        s = j * len(texts) // size
+        out += [b for b in chunks(m, texts[s : s + window], length=length, batch=1, limit=1)]
+    out = torch.cat(out)
+    return list(out.split(8))
+
+
+def evidence(lam, q, tr, n, rho, iterations=500):
+    """The MacKay evidence fixed point for the ridge of one layer's regression, in its eigen-coordinates: lam the eigenvalues of
+    the input scatter, q the squared projected cross-scatter, tr the trace of the output scatter, n the rows, rho the start.
+    Returns the ridge and gamma, the effective number of parameters."""
+    rss = lambda r: tr - float((q * (2 / (lam + r) - lam / (lam + r) ** 2)).sum())
+    r = rho
+    for _ in range(iterations):
+        g = float((lam / (lam + r)).sum())
+        new = g * rss(r) / (float((q / (lam + r) ** 2).sum()) * (n - g))
+        done = abs(new / r - 1) < 1e-10
+        r = new
+        if done:
+            break
+    return r, float((lam / (lam + r)).sum())
+
+
+@torch.no_grad()
+def residuals(m: Model, cal: Calibration, batches, gamma, store) -> tuple:
+    """The closure statistics of the typical attention's residuals: offsets [L, bucket, d], factors [L, d, d], counts [bucket]."""
+    L, d, dev = m.n_layers, m.hidden_dim, m.device
+    acc = torch.float64 if L * d * d * 8 < 4e9 else torch.float32
+    S = torch.zeros(L, d, d, dtype=acc, device=dev)
+    s = torch.zeros(L, NB, d, dtype=torch.float64, device=dev)
+    c = torch.zeros(NB, dtype=torch.float64, device=dev)
+    typ = [cal.typical(k) for k in range(L)]
+
+    def cap(k, u, a):
+        B, T, _ = u.shape
+        r = (a.reshape(-1, d).float() - typ[k](u.reshape(-1, d), 0).float()).view(B, T, d)[:, 1:]
+        b = torch.tensor([bucket(t) for t in range(1, T)], device=dev)
+        S[k] += torch.einsum("btd,bte->de", r.to(acc), r.to(acc))
+        s[k].index_add_(0, b, r.double().sum(0))
+        if k == 0:
+            c.index_add_(0, b, torch.full((T - 1,), float(B), dtype=torch.float64, device=dev))
+
+    for ids in batches:
+        forward(m, m.ids(ids), on_attention=cap)
+    off = s / c.clamp_min(1)[None, :, None]
+    for b in range(2, NB):  # buckets beyond the calibration length take the last one seen
+        if c[b] == 0:
+            off[:, b] = off[:, b - 1]
+    fac = torch.empty(L, d, d, device=store)
+    n = float(c.sum())
+    for k in range(L):
+        C = (S[k].double() - (off[k].T * c) @ off[k]) / n * (n / (n - gamma[k]))
+        lam, V = torch.linalg.eigh(C)
+        fac[k] = (V * lam.clamp_min(0).sqrt()).float().to(store)
+    return off.float(), fac, c.cpu()
+
+
 @torch.no_grad()
 def calibrate(m: Model, batches: Iterable, folds: int = 2, work=torch.float32, progress: bool = False) -> Calibration:
+    batches = list(batches)
     bank = _Moments(m, batches, folds, work, progress)
     L, d, dev, K = bank.L, bank.d, bank.dev, bank.K
     f64 = torch.float64
@@ -202,9 +264,10 @@ def calibrate(m: Model, batches: Iterable, folds: int = 2, work=torch.float32, p
     lam = torch.empty(L, d, device=dev)
     rho = torch.empty(L, device=dev)
     grid = torch.tensor(RHO, dtype=f64, device=dev)
+    gamma = []
     for k in range(L):
         mo = bank.moments(k)
-        n, mu, ma, Cuu, Cua, _ = _merge(mo)
+        n, mu, ma, Cuu, Cua, tr = _merge(mo)
         ubar[k], abar[k] = mu.float(), ma.float()
         rg = grid * (Cuu.diagonal().sum() / d)
         err = torch.zeros_like(rg)
@@ -229,14 +292,21 @@ def calibrate(m: Model, batches: Iterable, folds: int = 2, work=torch.float32, p
         ev, Qk = torch.linalg.eigh(Cuu.to(work))
         ev = ev.double().clamp_min(0)
         QAk = Qk.T @ Cua.to(work)
-        rk = float(rg[j])
+        rcv = float(rg[j])
+        rk, g = evidence(ev, (QAk.double() ** 2).sum(1), tr, n, rcv)
+        gamma.append(g)
         stats.append(
             {
                 "rows": n,
-                "ridge_relative": RHO[j],
-                "dof": float((ev / (ev + rk)).sum()),
-                "r2_heldout": 1 - float(err[j]) / tts,
+                "ridge_cv": rcv,
+                "ridge_evidence": rk,
+                "gamma": g,
+                "r2_heldout_cv": 1 - float(err[j]) / tts,
             }
         )
         Q[k], QA[k], lam[k], rho[k] = Qk.float().to(store), QAk.float().to(store), ev.float(), rk
-    return Calibration(ubar, abar, Q, lam, QA, rho, stats, model_id(m))
+    cal = Calibration(ubar, abar, Q, lam, QA, rho, None, None, None, stats, model_id(m))
+    cal.off, cal.fac, cal.count = residuals(m, cal, batches, gamma, store)
+    for k in range(L):
+        stats[k]["residual_count"] = float(cal.count.sum())
+    return cal

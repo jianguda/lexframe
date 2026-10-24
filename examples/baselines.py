@@ -17,13 +17,13 @@ from lexframe.baselines import JacobianLens, LogitLens
 name = "HuggingFaceTB/SmolLM3-3B"
 model = AutoModelForCausalLM.from_pretrained(name, device_map="cuda" if torch.cuda.is_available() else "cpu")
 tokenizer = AutoTokenizer.from_pretrained(name)
-texts = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")["text"][:1000]
+texts = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")["text"]
 
 frame = lf.LexFrame(model, tokenizer).init(texts)
 text = "The Eiffel Tower is located in the city of"
 methods = {
     "logit lens": LogitLens(model, tokenizer),
-    "Jacobian lens": JacobianLens(model, tokenizer).fit(texts, size=32),  # more sequences fit the lens better
+    "Jacobian lens": JacobianLens(model, tokenizer).fit(texts[:1000], size=32),  # more sequences fit the lens better
     "LexFrame": frame,
 }
 L = frame.num_layers
@@ -61,17 +61,11 @@ fig.savefig("baselines_tokens.png", dpi=150)
 print("saved baselines_tokens.png")
 
 # 2. The divergence in nats of each reading from the model's output, per layer, as a mean over the positions of a few
-# sequences: LexFrame of order 0, 1 and 2 (the calibration comes from the cache) next to the two lenses. A frame of
-# order n is exact where at most n layers remain, so its divergence there is zero and drops out of the log scale.
-readers = {
-    "logit lens": methods["logit lens"],
-    "Jacobian lens": methods["Jacobian lens"],
-    "LexFrame[0]": lf.LexFrame(model, tokenizer, order=0).init(texts),
-    "LexFrame[1]": frame,
-    "LexFrame[2]": lf.LexFrame(model, tokenizer, order=2).init(texts),
-}
+# sequences. The closure reading is not fitted to the output: it is what each state carries by itself, so its divergence
+# measures what the context has yet to add, and it reaches zero only at the output.
+readers = {"logit lens": methods["logit lens"], "Jacobian lens": methods["Jacobian lens"], "LexFrame": frame}
 length, count = 64, 8  # tokens per sequence and sequences
-seqs = [torch.tensor(i[:length]) for i in (tokenizer.encode(t, add_special_tokens=False) for t in texts)]
+seqs = [torch.tensor(i[:length]) for i in (tokenizer.encode(t, add_special_tokens=False) for t in texts[:1000])]
 seqs = [s for s in seqs if len(s) == length][:count]
 
 fig, ax = plt.subplots(figsize=(7, 4.5), layout="constrained")

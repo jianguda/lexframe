@@ -1,4 +1,5 @@
-"""Transport of order n: a state passes the model's own blocks with n rounds of attention between positions."""
+"""The native transport: states carried through the model's own remaining layers, each position attending to the true states of its
+prefix and to its own key."""
 
 import torch
 
@@ -16,6 +17,10 @@ def _window(m, k):
     return getattr(cfg, "sliding_window", None) if getattr(cfg, "use_sliding_window", True) else None
 
 
+def _additive(ok, dt):
+    return torch.zeros(ok.shape, dtype=dt, device=ok.device).masked_fill(~ok, torch.finfo(dt).min)[None, None]
+
+
 def _mask(n, ref, w, dev, dt):
     """Additive mask over [reference; query] (or only the query): query t sees reference positions s < t within the
     window and its own key, and nothing else; the reference rows see a causal prefix so that no row is empty."""
@@ -30,7 +35,17 @@ def _mask(n, ref, w, dev, dt):
         ok = torch.cat([top, bot])
     else:
         ok = torch.eye(n, dtype=torch.bool, device=dev)
-    return torch.zeros(ok.shape, dtype=dt, device=dev).masked_fill(~ok, torch.finfo(dt).min)[None, None]
+    return _additive(ok, dt)
+
+
+def causal(m, k, n, dev, dt):
+    """Layer k's own causal mask (with its sliding window, if any) over n positions."""
+    q = torch.arange(n, device=dev)
+    ok = q[None] <= q[:, None]
+    w = _window(m, k)
+    if w:
+        ok &= q[:, None] - q[None] < w
+    return _additive(ok, dt)
 
 
 def attend(m, k, uq, R=None, sub=32):
@@ -49,61 +64,20 @@ def attend(m, k, uq, R=None, sub=32):
     return torch.cat(out)
 
 
-def _step(m, cal, k, h, fi):
-    base = cal.typical(k)
-
-    def fn(u, s):
-        a = base(u, s)
-        sel = fi[(fi >= s) & (fi < s + u.shape[0])] - s
-        if sel.numel():
-            own = attend(m, k, u[sel][:, None])[:, 0]
-            a.index_copy_(0, sel, own.to(a.dtype))
-        return a
-
-    return block(m, k, h, fn)
-
-
-def _streams(m, cal, xs, LS, st):
+def native(m, xs, LS, X=None):
+    """The states of the layers LS < L (or the moved states X, one per layer of LS) carried to the output, [len(LS), B, T, d]:
+    every layer as the model computes it, with each position attending to the true states of its prefix and to its own key.
+    Unmoved states reproduce the model exactly."""
     L = int(m.n_layers)
-    LS = list(LS)
     B, Tn, d = xs[0].shape
-    dev = xs[0].device
-    ch = xs[0][:0].reshape(0, B, Tn, d)
-    rd = {nm: ch for nm in st}
-    nA = 0
+    rd = xs[0][:0].reshape(0, B, Tn, d)
     for k in range(LS[0], L):
-        norm = innorm(m, k)
         if k in LS:
-            ch = torch.cat([ch, xs[k][None]])
-            nA += 1
-            for nm, s in st.items():
-                x0 = s["x"][LS.index(k)] if "x" in s else xs[k]
-                rd[nm] = torch.cat([rd[nm], x0[None].to(xs[k].dtype)])
-        refs = {}
-
-        def pick(over, a):
-            if over not in refs:
-                src = xs[k][None].expand(nA, *xs[k].shape) if over == "true" else ch if over is None else rd[over]
-                refs[over] = norm(src.flatten(0, 1))
-            return refs[over][: a * B]
-
-        att = {
-            nm: attend(m, k, norm(rd[nm].flatten(0, 1)), pick(s.get("over"), rd[nm].shape[0])) for nm, s in st.items()
-        }
-        refs.clear()
-        fi = torch.arange(0, nA * B * Tn, Tn, device=dev)
-        ch = _step(m, cal, k, ch.reshape(-1, d), fi).view(nA, B, Tn, d)
-        for nm in att:
-            h = rd[nm]
-            a = att[nm].reshape(-1, d)
-            rd[nm] = block(m, k, h.reshape(-1, d), lambda u, s, a=a: a[s : s + u.shape[0]].to(u.dtype)).view(h.shape)
-        del att
-    return {**rd, "none": ch}
-
-
-def name(o):
-    return "none" if o == 0 else "layer" + (f"o{o}" if o > 1 else "")
-
-
-def chain(o):
-    return {name(i): {"over": None if i == 1 else name(i - 1)} for i in range(1, o + 1)}
+            x0 = xs[k] if X is None else X[LS.index(k)]
+            rd = torch.cat([rd, x0[None].to(xs[k].dtype)])
+        n = rd.shape[0]
+        norm = innorm(m, k)
+        ref = norm(xs[k])[None].expand(n, *xs[k].shape).flatten(0, 1)
+        a = attend(m, k, norm(rd.flatten(0, 1)), ref).reshape(-1, d)
+        rd = block(m, k, rd.reshape(-1, d), lambda u, s, a=a: a[s : s + u.shape[0]].to(u.dtype)).view(n, B, Tn, d)
+    return rd

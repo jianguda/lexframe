@@ -1,9 +1,9 @@
 """Plot what every layer of SmolLM3 reads about the Eiffel Tower: the top token at each position, the coefficients of
 the answer and the runner-up, and each layer's contribution to the answer (visualize.png); then follow the lexical bases
 around the state at the last position through the layers (visualize_bases.png); and, as in the paper, compare the
-directions of LexFrame and of two lenses with the model's own readouts, against the ceiling that no fixed lens can pass
-(visualize_directions.png); last, split each layer's contribution into attention and MLP and steer the state, with the
-frame's prediction next to the model's response (visualize_steering.png). Needs matplotlib."""
+directions of the closure readout and of two lenses with the model's own readouts, against the ceiling that no fixed lens
+can pass (visualize_directions.png); last, split each layer's contribution into attention and MLP and steer the state, with
+the frame's prediction next to the model's response (visualize_steering.png). Needs matplotlib."""
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
@@ -19,7 +19,7 @@ from lexframe.baselines import JacobianLens, LogitLens
 name = "HuggingFaceTB/SmolLM3-3B"
 model = AutoModelForCausalLM.from_pretrained(name, device_map="cuda" if torch.cuda.is_available() else "cpu")
 tokenizer = AutoTokenizer.from_pretrained(name)
-texts = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")["text"][:1000]
+texts = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")["text"]
 
 frame = lf.LexFrame(model, tokenizer).init(texts)
 
@@ -44,7 +44,7 @@ top_k = 3  # how many of the bases nearest to the state to follow at every layer
 extra = [rival]  # further labels whose bases to follow
 
 v = frame.view(text, k=top_k)
-coef = v.coef([answer, rival])[:, -1].cpu().numpy()
+coef = v.coef([answer, rival], "closure")[:, -1].cpu().numpy()  # what each state carries: its centred log reading
 contribution = frame.attr(text, target=answer)[:, -1]
 first = v.first_layer(answer)[-1]
 layers = range(frame.num_layers + 1)
@@ -68,7 +68,7 @@ ax2.plot(coef[:, 0], layers, label=answer.strip())
 ax2.plot(coef[:, 1], layers, label=rival.strip())
 if first >= 0:
     ax2.axhline(first, color="grey", linestyle=":", label=f"{answer.strip()} on top")
-ax2.set_xlabel("coefficient (centred logit)")
+ax2.set_xlabel("closure coefficient (centred log reading)")
 ax2.set_title("answer and runner-up")
 ax2.legend()
 
@@ -80,10 +80,10 @@ ax3.set_title(f"who wrote {answer.strip()}")
 fig.savefig("visualize.png", dpi=150)
 print("saved visualize.png")
 
-# 4. Where the state at the last position sits among the lexical bases, layer by layer: its cosine with each basis
-# and its coefficient on it, its coordinate in the frame. Followed are the bases of the input token at this position,
-# where the state starts, of the model's output, where it ends, of the extra labels, and at every layer the top_k
-# nearest ones, those with the largest coefficients.
+# 4. Where the state at the last position sits among the lexical bases, layer by layer: its cosine with each basis of the
+# native frame and its closure coefficient on it, what the state carries of that token. Followed are the bases of the
+# input token at this position, where the state starts, of the model's output, where it ends, of the extra labels, and
+# at every layer the top_k nearest ones, those with the largest coefficients.
 near = v.ids[:, -1]  # [layer, top_k]
 start = tokenizer.encode(text, add_special_tokens=False)[-1]
 target = int(near[-1, 0])
@@ -94,7 +94,7 @@ tracked = list(dict.fromkeys([*roles, *(int(t) for t in near.reshape(-1))]))
 names = [label(t) for t in tracked]
 b = v.basis(tracked)[:, -1].float()  # [layer, token, hidden]
 cos = torch.nn.functional.cosine_similarity(b, v.vector[:, -1, None].float(), dim=-1).cpu().numpy()
-coef = v.coef(tracked)[:, -1].cpu().numpy()
+coef = v.coef(tracked, "closure")[:, -1].cpu().numpy()
 
 cell = lambda i, l: f"{names[i]} {coef[l, i]:+.1f} {cos[l, i]:+.2f}"
 print(f"layer: the {top_k} nearest bases | " + ", ".join(f"{r} {names[tracked.index(t)]}" for t, r in roles.items()))
@@ -122,8 +122,8 @@ for i, token in enumerate(tracked):
 ax1.plot([], [], color="grey", linewidth=0.8, label=f"top {top_k} nearest at some layer")
 ax1.set_ylabel("cosine of the state with the basis")
 ax1.set_title("the state's angle to each basis")
-ax2.set_ylabel("coefficient (centred logit)")
-ax2.set_title("the state's coordinate on each basis")
+ax2.set_ylabel("closure coefficient (centred log reading)")
+ax2.set_title("what the state carries of each token")
 fig.legend(*ax1.get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize=8, frameon=False)
 for ax in (ax1, ax2):
     ax.set_xlabel("layer")
@@ -134,26 +134,26 @@ print("saved visualize_bases.png")
 # 5. As in the paper: the cosine of each method's readout of a label with the model's own readout (the native frame),
 # per layer, as a mean over the states of a few sequences and over labels, with a 95% interval over the sequences.
 # The ceiling sqrt(kappa) is the best mean cosine that any lens with fixed directions per layer can reach, as
-# frame.bound() computes it, from the same readouts. The first position, which attends only to itself, is left out.
-native = lf.LexFrame(model, tokenizer, order="inf").init(texts)  # the calibration comes from the cache
+# frame.bound() computes it, from the same readouts. The closure readout is the gradient of the state's own reading; the
+# frame gap is one minus its cosine. The first position, which attends only to itself, is left out.
+logit, jacobian = LogitLens(model, tokenizer), JacobianLens(model, tokenizer).fit(texts[:1000], size=32)
 methods = {
-    "logit lens": LogitLens(model, tokenizer),
-    "Jacobian lens": JacobianLens(model, tokenizer).fit(texts, size=32),  # more sequences fit the lens better
-    "LexFrame[1]": frame,
-    "LexFrame[2]": lf.LexFrame(model, tokenizer, order=2).init(texts),
+    "logit lens": lambda s: logit.view(s).readout(labels),
+    "Jacobian lens": lambda s: jacobian.view(s).readout(labels),  # more sequences fit the lens better
+    "closure readout": lambda s: frame.view(s).readout(labels, "closure"),
 }
 labels = [" the", " of", " and", " in", " city", " people", " world", " time"]
 length, count = 32, 8  # tokens per sequence and sequences
-seqs = [torch.tensor(i[:length]) for i in (tokenizer.encode(t, add_special_tokens=False) for t in texts)]
+seqs = [torch.tensor(i[:length]) for i in (tokenizer.encode(t, add_special_tokens=False) for t in texts[:1000])]
 seqs = [s for s in seqs if len(s) == length][:count]
 
 cosines = {title: [] for title in methods}
 units = []
 for s in seqs:
-    truth = native.view(s).readout(labels)[:, 1:]  # [layer, position, label, hidden]
+    truth = frame.view(s).readout(labels)[:, 1:]  # [layer, position, label, hidden]
     units.append((truth / truth.norm(dim=-1, keepdim=True).clamp_min(1e-30)).sum(1).double())
     for title, method in methods.items():
-        r = method.view(s).readout(labels)[:, 1:]
+        r = method(s)[:, 1:]
         c = torch.nn.functional.cosine_similarity(r, truth.to(r.device), dim=-1)
         cosines[title].append(c.mean((1, 2)).cpu().numpy())
 U = torch.stack(units)  # [sequence, layer, label, hidden]: each sequence's sum of unit readouts
@@ -179,19 +179,19 @@ print("saved visualize_directions.png")
 
 # 6. Who wrote the answer, split into the attention and MLP sublayers of each layer, and what a steer does: move the
 # state at mid-depth or later from the answer toward the runner-up by a growing amount, then compare the change in
-# their coefficients that the frame predicts with the change in the model's own output, read in the native frame.
+# their coefficients that the readout predicts with the change in the model's own output, read in the native frame.
 attn = frame.attr(text, "attn", target=answer)[:, -1]
 mlp = frame.attr(text, "mlp", target=answer)[:, -1]
 at = max(int(first), frame.num_layers // 2)
 s = frame.view(text, layers=at)
 o = s.readout([answer, rival])
-base = native.view(s).coef([answer, rival])[-1]
+base = s.coef([answer, rival])[-1]
 sizes = np.linspace(0, 8, 17)
 predicted, actual, top = [], [], []
 for size in sizes:
     moved = s.steer({answer: -size, rival: size})
     predicted.append((o @ (moved - s).vector[..., None])[-1, :, 0].float().cpu().numpy())
-    out = native.view(moved)
+    out = frame.view(moved, frame="native")
     actual.append((out.coef([answer, rival])[-1] - base).float().cpu().numpy())
     top.append(out.tokens[-1][0])
 predicted, actual = np.stack(predicted), np.stack(actual)
