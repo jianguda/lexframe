@@ -9,6 +9,14 @@ from typing import Any, Callable
 import torch
 
 
+def eigh(S: torch.Tensor):
+    """torch.linalg.eigh of a symmetric matrix, on the CPU where the device has none (Apple MPS)."""
+    if S.device.type != "mps":
+        return torch.linalg.eigh(S)
+    lam, U = torch.linalg.eigh(S.cpu())
+    return lam.to(S.device), U.to(S.device)
+
+
 @dataclass
 class Model:
     hf: Any
@@ -217,7 +225,10 @@ def innorm(m: Model, k: int):
     return getattr(m.layers[k], "input_layernorm", None) or (lambda x: x)
 
 
-def block(m: Model, k: int, x: torch.Tensor, read: Callable, chunk: int = 8192) -> torch.Tensor:
+BLOCK_ROWS = 8192  # rows of one pass of block(): bounds the memory of the layer's intermediate activations
+
+
+def block(m: Model, k: int, x: torch.Tensor, read: Callable) -> torch.Tensor:
     layer = m.layers[k]
     own = layer.self_attn
     out = []
@@ -225,9 +236,9 @@ def block(m: Model, k: int, x: torch.Tensor, read: Callable, chunk: int = 8192) 
     stub.own = [own]
     try:
         with eager(m):
-            for s in range(0, x.shape[0], chunk):
+            for s in range(0, x.shape[0], BLOCK_ROWS):
                 stub.start = s
-                y = layer(x[None, s : s + chunk])
+                y = layer(x[None, s : s + BLOCK_ROWS])
                 out.append((y[0] if isinstance(y, tuple) else y)[0])
     finally:
         layer.self_attn = own
@@ -244,4 +255,36 @@ def logprobs(m: Model, h: torch.Tensor) -> torch.Tensor:
 
 
 def kl(lp: torch.Tensor, lq: torch.Tensor) -> torch.Tensor:
-    return (lp.exp() * (lp - lq)).sum(-1)
+    """KL(p || q) from log-probabilities, free of the cancellation of two separately rounded log-softmaxes: the log-ratio
+    d = log q - log p is centred under p, so a common rounding offset of the two normalisers cancels exactly, and
+    KL = -sum p (d_c - log1p(sum p expm1(d_c))) is accurate for small divergences and never negative. Rows where the ratio overflows
+    take the naive sum."""
+    p = lp.exp()
+    naive = (p * (lp - lq)).sum(-1)
+    d = torch.where(p > 0, lq - lp, torch.zeros_like(lp))
+    dc = d - (p * d).sum(-1, keepdim=True)
+    fixed = -(p * (dc - torch.log1p((p * torch.expm1(dc)).sum(-1, keepdim=True)))).sum(-1)
+    return torch.where(torch.isfinite(fixed), fixed, naive)
+
+
+def label_id(m: Model, label: int | str) -> int:
+    """The id of a label, given as an id or as a string: one that the tokenizer encodes to exactly one token, or any label text that
+    decoding returns (special tokens and byte fragments included)."""
+    if not isinstance(label, str):
+        return int(label)
+    tok = m.tokenizer
+    if tok is None:
+        raise ValueError(f"a label given as the string {label!r} needs the tokenizer")
+    ids = tok.encode(label, add_special_tokens=False)
+    if len(ids) == 1:
+        return ids[0]
+    decoded = getattr(m, "_decoded", None)
+    if decoded is None:  # the text of every vocabulary entry, the first id for each
+        decoded = {}
+        for i in range(m.lm_head.weight.shape[0]):
+            decoded.setdefault(tok.decode([i]), i)
+        m._decoded = decoded
+    if label in decoded:
+        return decoded[label]
+    pieces = [tok.decode([i]) for i in ids]
+    raise ValueError(f"{label!r} is {len(ids)} tokens, {pieces}; give a single token or its id")

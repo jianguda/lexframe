@@ -16,18 +16,20 @@ def test_logit_lens(frame):
     from lexframe._model import forward, logprobs
 
     lens = B.LogitLens(frame._m)
-    v = lens.view(TEXT, k=3)
+    s = lens.state(TEXT)
+    labels, probs = s.decode().top(3)
     hL, xs, _ = forward(frame._m, frame._m.ids(TEXT))
-    want = logprobs(frame._m, xs[2][0]).topk(3, -1).indices.cpu().numpy()
-    assert v.lens == "logit" and np.array_equal(v.ids[2], want)
-    assert np.allclose(v.kl[L], 0, atol=1e-5) and np.array_equal(v.ids[L], frame.view(TEXT, k=3).ids[L])
-    out = frame.view(TEXT, layers=L)
-    assert torch.allclose(lens.view(TEXT, layers=L).coef([PARIS, LONDON]), out.coef([PARIS, LONDON]))
-    assert torch.allclose(lens.view(TEXT, layers=L).readout([PARIS]), out.readout([PARIS]), atol=1e-5)
-    r = v.readout([PARIS, LONDON])
+    want = logprobs(frame._m, xs[2][0]).topk(3, -1)
+    assert s.lens == "logit" and labels.shape == (L + 1, T, 3)
+    assert np.array_equal(labels[2], np.vectorize(lambda i: TOK.decode([int(i)]))(want.indices.cpu().numpy()))
+    assert np.allclose(probs[2], want.values.exp().cpu().numpy(), atol=1e-6)
+    assert np.allclose(s.decode().kl[L], 0, atol=1e-5) and np.array_equal(labels[L], frame.state(TEXT)[L].decode().top(3)[0])
+    out = frame.state(TEXT)[L]
+    assert torch.allclose(lens.state(TEXT)[L].decode().logits([PARIS, LONDON]), out.decode().logits([PARIS, LONDON]))
+    assert torch.allclose(lens.state(TEXT)[L].gradient([PARIS]), out.gradient([PARIS]), atol=1e-5)
+    r = s.gradient([PARIS, LONDON])
     assert r.shape == (L + 1, T, 2, frame._m.hidden_dim) and torch.isfinite(r).all()
-    assert not hasattr(v, "basis") and not hasattr(v, "steer")
-    assert v.first_layer(int(v.ids[L, -1, 0]))[-1] <= L
+    assert not hasattr(s, "direction") and not hasattr(s, "steer")
 
 
 def test_jacobian_lens_matches_its_definition(frame, tmp_path):
@@ -67,40 +69,45 @@ def test_jacobian_lens_matches_its_definition(frame, tmp_path):
             assert torch.allclose(J[layer - 1][:, j].double(), col, atol=2e-2, rtol=2e-2)
 
 
-def test_jacobian_lens(frame, tmp_path):
+def test_jacobian_lens(frame, tmp_path, monkeypatch):
     m = frame._m
+    monkeypatch.setenv("LEXFRAME_CACHE", str(tmp_path))
     with pytest.raises(RuntimeError, match="fit"):
-        B.JacobianLens(m).view(TEXT)
-    f = B.JacobianLens(m).fit(TEXTS, size=4, cache_dir=str(tmp_path))
+        B.JacobianLens(m).state(TEXT)
+    f = B.JacobianLens(m).fit(TEXTS, size=4)
     assert f.jacobian.shape == (L, m.hidden_dim, m.hidden_dim) and f.jacobian.dtype == torch.float16
     assert torch.isnan(f.jacobian[0]).all()
-    v = f.view(TEXT, k=2)
-    assert v.lens == "jacobian" and (v.ids[0] == -1).all() and np.isnan(v.kl[0]).all() and np.isfinite(v.kl[1:]).all()
-    assert np.allclose(v.kl[L], 0, atol=1e-5) and (v.tokens[0] == "").all()
-    r = v.readout([PARIS])
+    s = f.state(TEXT)
+    labels, probs = s.decode().top(2)
+    kl = s.decode().kl
+    assert s.lens == "jacobian" and (labels[0] == "").all() and np.isnan(probs[0]).all()
+    assert np.isnan(kl[0]).all() and np.isfinite(kl[1:]).all() and np.allclose(kl[L], 0, atol=1e-5)
+    r = s.gradient([PARIS])
     assert torch.isnan(r[0]).all() and torch.isfinite(r[1:]).all()
-    again = B.JacobianLens(m).fit(TEXTS, size=4, cache_dir=str(tmp_path))
+    assert torch.isnan(s.decode().logits([PARIS])[0]).all()
+    again = B.JacobianLens(m).fit(TEXTS, size=4)
     assert len(os.listdir(tmp_path)) == 1 and torch.equal(again.jacobian[1:], f.jacobian[1:])
-    assert np.array_equal(again.view(TEXT, k=2).ids, v.ids)
+    assert np.array_equal(again.state(TEXT).decode().top(2)[0], labels)
 
-    seqs = [s[0] for s in B.sequences(m, TEXTS, limit=2)]
-    one = B.JacobianLens(m).fit(seqs, cache_dir=str(tmp_path), progress=False)
-    joined = B.JacobianLens(m).fit([torch.cat(seqs)], cache_dir=str(tmp_path), progress=False)
+    seqs = [s_[0] for s_ in B._sequences(m, TEXTS, limit=2)]
+    one = B.JacobianLens(m).fit(seqs)
+    joined = B.JacobianLens(m).fit([torch.cat(seqs)])
     assert len(os.listdir(tmp_path)) == 3 and not torch.equal(one.jacobian[1:], joined.jacobian[1:])
-    rows = B.JacobianLens(m).fit([torch.stack(seqs)], cache=False, progress=False)
-    assert torch.equal(rows.jacobian[1:], one.jacobian[1:])
+    monkeypatch.setenv("LEXFRAME_CACHE", str(tmp_path / "rows"))  # a fresh cache: the rows are fitted, not loaded
+    rows = B.JacobianLens(m).fit([torch.stack(seqs)])
+    assert len(os.listdir(tmp_path / "rows")) == 1 and torch.equal(rows.jacobian[1:], one.jacobian[1:])
 
 
-def test_lens_positions_and_batches(frame):
+def test_lens_positions(frame):
     lens = B.LogitLens(frame._m)
-    last = lens.view(TEXT, k=2, positions=-1)
-    whole = lens.view(TEXT, k=2)
-    assert last.positions == [T - 1] and np.array_equal(last.ids[:, 0], whole.ids[:, -1])
-    assert last.coef([PARIS]).shape == (L + 1, 1, 1) and last.readout([PARIS]).shape[-1] == frame._m.hidden_dim
-    vs = lens.view([TEXT, "the city of"])
-    assert isinstance(vs, list) and [v.ids.shape[1] for v in vs] == [T, 3]
-    assert lens.view([TEXT, TEXT]).kl.shape == (2, L + 1, T)
+    s = lens.state(TEXT)
+    last = s[:, -1]
+    whole = s.decode().top(2)[0]
+    assert last.positions == [T - 1] and np.array_equal(last.decode().top(2)[0], whole[:, -1])
+    kept = s[:, [-1]]
+    assert kept.decode().logits([PARIS]).shape == (L + 1, 1, 1) and kept.gradient([PARIS]).shape[-1] == frame._m.hidden_dim
     with pytest.raises(ValueError, match="one text"):
-        lens.view([TEXT, TEXT]).coef([PARIS])
-    one = lens.view(TEXT, layers=2)
-    assert one.ids.shape == (T, 1) and one.coef([PARIS]).shape == (T, 1)
+        lens.state([TEXT, TEXT])
+    one = s[2]
+    assert one.decode().top(1)[0].shape == (T, 1) and one.decode().logits([PARIS]).shape == (T, 1)
+    assert one.layers == [2] and torch.equal(one.vector, s.vector[2])

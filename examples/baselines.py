@@ -1,6 +1,6 @@
 """LexFrame next to two baselines, the logit lens and the Jacobian lens, on SmolLM3: the top token that each reads at
 every second layer and every position (baselines_tokens.png), and, as in the paper, how far each reading lies from the
-model's own output, layer by layer (baselines_divergence.png). examples/visualize.py compares their directions. Needs
+model's own output, layer by layer (baselines_divergence.png). examples/visualize.py compares their gradients. Needs
 matplotlib."""
 
 import matplotlib.pyplot as plt
@@ -35,22 +35,28 @@ plt.rcParams["font.family"] = ["DejaVu Sans", *cjk[:1]]
 sand = ListedColormap(plt.colormaps["YlOrBr"](np.linspace(0, 0.55, 256)))
 
 
-def label(token: int, width: int = 6) -> str:
-    """A token as short printable text: control characters escaped, without its leading space and cut to width."""
-    text = repr(tokenizer.decode([token]).lstrip(" ") or "_")[1:-1]
+def label(token: str, width: int = 6) -> str:
+    """A label as short printable text: control characters escaped, without its leading space and cut to width."""
+    text = repr(token.lstrip(" ") or "_")[1:-1]
     return text if len(text) <= width else text[: width - 1] + "."
+
+
+def decoding(method, text, layers=slice(None)):
+    """What a method reads from the states of `text` at `layers`: a lens its own decoding, LexFrame the reading without
+    context, what each state carries by itself."""
+    s = method.state(text)[layers]
+    return s.decode(context=False) if method is frame else s.decode()
 
 
 # 1. The top token of each reading at every second layer and every position, shaded by its probability.
 rows = sorted(set(range(0, L + 1, 2)) | {L})
-words = [label(i) for i in tokenizer.encode(text, add_special_tokens=False)]
+words = [label(tokenizer.decode([i])) for i in tokenizer.encode(text, add_special_tokens=False)]
 fig, axes = plt.subplots(1, 3, figsize=(18, 8), sharey=True, layout="constrained")
 for ax, (title, method) in zip(axes, methods.items()):
-    v = method.view(text)
-    probs = np.nan_to_num(v.probs[rows, :, 0])
-    image = ax.imshow(probs, aspect="auto", origin="lower", cmap=sand, vmin=0, vmax=1, alpha=0.8)
-    for (row, position), token in np.ndenumerate(v.ids[rows, :, 0]):
-        if token >= 0:
+    tokens, probs = decoding(method, text, rows).top(1)
+    image = ax.imshow(np.nan_to_num(probs[..., 0]), aspect="auto", origin="lower", cmap=sand, vmin=0, vmax=1, alpha=0.8)
+    for (row, position), token in np.ndenumerate(tokens[..., 0]):
+        if not np.isnan(probs[row, position, 0]):  # a lens that does not read a layer gives "" and NaN there
             ax.text(position, row, label(token), ha="center", va="center", fontsize=8)
     ax.set_xticks(range(len(words)), words, rotation=45, ha="right")
     ax.set_title(title)
@@ -61,7 +67,7 @@ fig.savefig("baselines_tokens.png", dpi=150)
 print("saved baselines_tokens.png")
 
 # 2. The divergence in nats of each reading from the model's output, per layer, as a mean over the positions of a few
-# sequences. The closure reading is not fitted to the output: it is what each state carries by itself, so its divergence
+# sequences. The reading without context is not fitted to the output: it is what each state carries by itself, so its divergence
 # measures what the context has yet to add, and it reaches zero only at the output.
 readers = {"logit lens": methods["logit lens"], "Jacobian lens": methods["Jacobian lens"], "LexFrame": frame}
 length, count = 64, 8  # tokens per sequence and sequences
@@ -70,7 +76,7 @@ seqs = [s for s in seqs if len(s) == length][:count]
 
 fig, ax = plt.subplots(figsize=(7, 4.5), layout="constrained")
 for title, reader in readers.items():
-    divergence = np.mean([reader.view(s).kl.mean(-1) for s in seqs], 0)[:L]  # the output itself has none
+    divergence = np.mean([decoding(reader, s, slice(0, L)).kl.mean(-1) for s in seqs], 0)  # the output itself has none
     ax.plot(range(L), np.where(divergence > 1e-8, divergence, np.nan), label=title)
 ax.set_yscale("log")
 ax.set_xlabel("layer")

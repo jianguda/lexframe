@@ -28,7 +28,7 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest>=9.0.3"]
-demo = ["datasets>=4.5.0"]
+demo = ["datasets>=4.5.0", "matplotlib>=3.10"]
 
 [project.urls]
 Homepage = "https://github.com/jianguda/lexframe"

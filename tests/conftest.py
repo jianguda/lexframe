@@ -79,10 +79,10 @@ def kind(request):
 
 @pytest.fixture(scope="session")
 def frame(kind, tmp_path_factory):
-    return lf.LexFrame(hf_model(kind), tokenizer()).init(TEXTS, cache_dir=str(tmp_path_factory.mktemp("cache")))
+    cache = str(tmp_path_factory.mktemp("cache"))
+    return lf.LexFrame(hf_model(kind), tokenizer()).config(cache=cache, progress=False).init(TEXTS)
 
 
-def with_order(frame, order):
-    f = lf.LexFrame(frame._m, order=order)
-    f.calibration = frame.calibration
-    return f
+def fresh(model, cache=None):
+    """A calibrated frame of a model, without a cache by default and without a progress bar."""
+    return lf.LexFrame(model, tokenizer()).config(cache=cache, progress=False).init(TEXTS)

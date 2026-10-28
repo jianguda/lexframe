@@ -1,7 +1,7 @@
-"""Plot what every layer of SmolLM3 reads about the Eiffel Tower: the top token at each position, the coefficients of
-the answer and the runner-up, and each layer's contribution to the answer (visualize.png); then follow the lexical bases
-around the state at the last position through the layers (visualize_bases.png); and, as in the paper, compare the
-directions of the closure readout and of two lenses with the model's own readouts, against the ceiling that no fixed lens
+"""Plot what every layer of SmolLM3 reads about the Eiffel Tower: the top token at each position, the logits without
+context of the answer and the runner-up, and each layer's contribution to the answer (visualize.png); then follow the labels' directions
+around the state at the last position through the layers (visualize_frame.png); and, as in the paper, compare the
+gradients without context and of two lenses with the model's own gradients (with context), against the ceiling that no fixed lens
 can pass (visualize_directions.png); last, split each layer's contribution into attention and MLP and steer the state, with
 the frame's prediction next to the model's response (visualize_steering.png). Needs matplotlib."""
 
@@ -30,23 +30,27 @@ plt.rcParams["font.family"] = ["DejaVu Sans", *cjk[:1]]
 sand = ListedColormap(plt.colormaps["YlOrBr"](np.linspace(0, 0.55, 256)))
 
 
-def label(token: int, quote: bool = True, width: int = 12) -> str:
-    """A token as printable text: escaped, shortened, and its id where it decodes to nothing (e.g. padding rows)."""
-    text = repr(tokenizer.decode([token]))[1:-1]
+def label(token: str, quote: bool = True, width: int = 12) -> str:
+    """A label as printable text: escaped, shortened, and "#" where it decodes to nothing (e.g. padding rows)."""
+    text = repr(token)[1:-1]
     text = text[: width - 3] + "..." if len(text) > width else text
     text = text if quote or text.strip() else "_" * bool(text)  # a bare space would leave its cell blank
-    return (f"'{text}'" if quote else text) if text else f"#{token}"
+    return (f"'{text}'" if quote else text) if text else "#"
 
 
 text = "The Eiffel Tower is located in the city of"
 answer, rival = " Paris", " London"
-top_k = 3  # how many of the bases nearest to the state to follow at every layer
-extra = [rival]  # further labels whose bases to follow
+top_k = 3  # how many of the reading's top tokens to follow at every layer
+extra = [rival]  # further labels whose directions to follow
 
-v = frame.view(text, k=top_k)
-coef = v.coef([answer, rival], "closure")[:, -1].cpu().numpy()  # what each state carries: its centred log reading
-contribution = frame.attr(text, target=answer)[:, -1]
-first = v.first_layer(answer)[-1]
+state = frame.state(text)  # every layer and position
+tokens, probs = state.decode(context=False).top(top_k)  # the reading without context: what each state carries by itself
+last = state[:, -1]  # every layer at the last position
+logit0 = last.decode(context=False).logits([answer, rival]).cpu().numpy()  # what each state carries: centred logits without context
+attribution = frame.trail(text, label=answer).attribute()  # [layer, 3]: the whole write, its attention part, its MLP part
+contribution = attribution[:, 0]  # each layer's whole write: the change of the answer's logit when it is removed
+tops = tokens[:, -1, 0] == answer
+first = int(np.argmax(tops)) if tops.any() else -1  # the first layer where the answer tops the reading
 layers = range(frame.num_layers + 1)
 
 fig, (ax1, ax2, ax3) = plt.subplots(
@@ -54,21 +58,21 @@ fig, (ax1, ax2, ax3) = plt.subplots(
 )
 
 # 1. The top token of the reading at every layer and position, shaded by its probability.
-image = ax1.imshow(v.probs[..., 0], aspect="auto", origin="lower", cmap=sand, vmin=0, vmax=1, alpha=0.8)
-for (layer, position), token in np.ndenumerate(v.ids[..., 0]):
+image = ax1.imshow(probs[..., 0], aspect="auto", origin="lower", cmap=sand, vmin=0, vmax=1, alpha=0.8)
+for (layer, position), token in np.ndenumerate(tokens[..., 0]):
     ax1.text(position, layer, label(token, quote=False), ha="center", va="center", fontsize=6)
-words = [label(i, quote=False) for i in tokenizer.encode(text, add_special_tokens=False)]
+words = [label(tokenizer.decode([i]), quote=False) for i in tokenizer.encode(text, add_special_tokens=False)]
 ax1.set_xticks(range(len(words)), words, rotation=45, ha="right")
 ax1.set_ylabel("layer (0 is the embedding, the last is the output)")
 ax1.set_title("top token of each layer's reading")
 fig.colorbar(image, ax=ax1, label="probability", location="left")
 
-# 2. The coefficients of the answer and the runner-up at the last position.
-ax2.plot(coef[:, 0], layers, label=answer.strip())
-ax2.plot(coef[:, 1], layers, label=rival.strip())
+# 2. The logits without context of the answer and the runner-up at the last position.
+ax2.plot(logit0[:, 0], layers, label=answer.strip())
+ax2.plot(logit0[:, 1], layers, label=rival.strip())
 if first >= 0:
     ax2.axhline(first, color="grey", linestyle=":", label=f"{answer.strip()} on top")
-ax2.set_xlabel("closure coefficient (centred log reading)")
+ax2.set_xlabel("logit without context (centred log reading)")
 ax2.set_title("answer and runner-up")
 ax2.legend()
 
@@ -80,29 +84,32 @@ ax3.set_title(f"who wrote {answer.strip()}")
 fig.savefig("visualize.png", dpi=150)
 print("saved visualize.png")
 
-# 4. Where the state at the last position sits among the lexical bases, layer by layer: its cosine with each basis of the
-# native frame and its closure coefficient on it, what the state carries of that token. Followed are the bases of the
-# input token at this position, where the state starts, of the model's output, where it ends, of the extra labels, and
-# at every layer the top_k nearest ones, those with the largest coefficients.
-near = v.ids[:, -1]  # [layer, top_k]
-start = tokenizer.encode(text, add_special_tokens=False)[-1]
-target = int(near[-1, 0])
+# 4. Where the state at the last position sits among the labels' directions, layer by layer: its cosine with each direction
+# (the label's direction) and its logit without context, what the state carries
+# of that token. Followed are the directions of the input token at this position, where the state starts, of the model's output,
+# where it ends, of the extra labels, and at every layer the reading's top_k tokens.
+near = tokens[:, -1]  # [layer, top_k]
+start = tokenizer.decode(tokenizer.encode(text, add_special_tokens=False)[-1:])
+target = near[-1, 0]
+# labels come as text: one that does not encode back to a single token (a special token, a partial character) is not followed
+single = lambda token: len(tokenizer.encode(token, add_special_tokens=False)) == 1
 roles = {}
-for token, role in [(start, "input"), (target, "output"), *((frame.token_id(t), "extra") for t in extra)]:
-    roles.setdefault(token, role)
-tracked = list(dict.fromkeys([*roles, *(int(t) for t in near.reshape(-1))]))
+for token, role in [(start, "input"), (target, "output"), *((t, "extra") for t in extra)]:
+    if single(token):
+        roles.setdefault(token, role)
+tracked = [t for t in dict.fromkeys([*roles, *near.reshape(-1)]) if single(t)]
 names = [label(t) for t in tracked]
-b = v.basis(tracked)[:, -1].float()  # [layer, token, hidden]
-cos = torch.nn.functional.cosine_similarity(b, v.vector[:, -1, None].float(), dim=-1).cpu().numpy()
-coef = v.coef(tracked, "closure")[:, -1].cpu().numpy()
+b = last.direction(tracked).float()  # [layer, label, hidden]: the directions
+cos = torch.nn.functional.cosine_similarity(b, last.vector[:, None].float(), dim=-1).cpu().numpy()
+logit0 = last.decode(context=False).logits(tracked).cpu().numpy()
 
-cell = lambda i, l: f"{names[i]} {coef[l, i]:+.1f} {cos[l, i]:+.2f}"
-print(f"layer: the {top_k} nearest bases | " + ", ".join(f"{r} {names[tracked.index(t)]}" for t, r in roles.items()))
-print("       (each as token, coefficient, cosine)")
+cell = lambda i, l: f"{names[i]} {logit0[l, i]:+.1f} {cos[l, i]:+.2f}"
+print(f"layer: the reading's top {top_k} | " + ", ".join(f"{r} {names[tracked.index(t)]}" for t, r in roles.items()))
+print("       (each as token, logit without context, cosine)")
 for l in layers:
-    nearest = "  ".join(cell(tracked.index(int(t)), l) for t in near[l])
+    leading = "  ".join(cell(tracked.index(t), l) for t in near[l] if t in tracked)
     fixed = "  ".join(cell(i, l) for i in range(len(roles)))
-    print(f"{l:>5}: {nearest} | {fixed}")
+    print(f"{l:>5}: {leading} | {fixed}")
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5), layout="constrained")
 style = {"input": dict(color="tab:blue", linestyle="--"), "output": dict(color="tab:red", linewidth=2.5)}
@@ -115,32 +122,32 @@ for i, token in enumerate(tracked):
         kw = dict(style.get(role) or dict(color=next(others)))
         kw["label"] = f"{role} {names[i]}"
     ax1.plot(layers, cos[:, i], **kw)
-    ax2.plot(layers, coef[:, i], **kw)
-    if role is None:  # name each nearby basis where the state holds most of it
-        l = int(coef[:, i].argmax())
-        ax2.annotate(names[i], (l, coef[l, i]), fontsize=6, color="dimgrey")
-ax1.plot([], [], color="grey", linewidth=0.8, label=f"top {top_k} nearest at some layer")
-ax1.set_ylabel("cosine of the state with the basis")
-ax1.set_title("the state's angle to each basis")
-ax2.set_ylabel("closure coefficient (centred log reading)")
+    ax2.plot(layers, logit0[:, i], **kw)
+    if role is None:  # name each nearby direction where the state holds most of it
+        l = int(logit0[:, i].argmax())
+        ax2.annotate(names[i], (l, logit0[l, i]), fontsize=6, color="dimgrey")
+ax1.plot([], [], color="grey", linewidth=0.8, label=f"in the top {top_k} at some layer")
+ax1.set_ylabel("cosine of the state with the direction")
+ax1.set_title("the state's angle to each direction")
+ax2.set_ylabel("logit without context (centred log reading)")
 ax2.set_title("what the state carries of each token")
 fig.legend(*ax1.get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize=8, frameon=False)
 for ax in (ax1, ax2):
     ax.set_xlabel("layer")
     ax.xaxis.get_major_locator().set_params(integer=True)
-fig.savefig("visualize_bases.png", dpi=150)
-print("saved visualize_bases.png")
+fig.savefig("visualize_frame.png", dpi=150)
+print("saved visualize_frame.png")
 
-# 5. As in the paper: the cosine of each method's readout of a label with the model's own readout (the native frame),
+# 5. As in the paper: the cosine of each method's gradient of a label with the model's own gradient (with context),
 # per layer, as a mean over the states of a few sequences and over labels, with a 95% interval over the sequences.
-# The ceiling sqrt(kappa) is the best mean cosine that any lens with fixed directions per layer can reach, as
-# frame.bound() computes it, from the same readouts. The closure readout is the gradient of the state's own reading; the
-# frame gap is one minus its cosine. The first position, which attends only to itself, is left out.
+# The ceiling sqrt(kappa) is the best mean cosine that any lens with fixed directions per layer can reach, computed from the
+# same gradients. The gradient without context is the gradient of the state's own reading; one minus its cosine is
+# what the context still reinterprets. The first position, which attends only to itself, is left out.
 logit, jacobian = LogitLens(model, tokenizer), JacobianLens(model, tokenizer).fit(texts[:1000], size=32)
 methods = {
-    "logit lens": lambda s: logit.view(s).readout(labels),
-    "Jacobian lens": lambda s: jacobian.view(s).readout(labels),  # more sequences fit the lens better
-    "closure readout": lambda s: frame.view(s).readout(labels, "closure"),
+    "logit lens": lambda s: logit.state(s).gradient(labels),
+    "Jacobian lens": lambda s: jacobian.state(s).gradient(labels),  # more sequences fit the lens better
+    "without context": lambda s: frame.state(s).gradient(labels, context=False),
 }
 labels = [" the", " of", " and", " in", " city", " people", " world", " time"]
 length, count = 32, 8  # tokens per sequence and sequences
@@ -150,13 +157,13 @@ seqs = [s for s in seqs if len(s) == length][:count]
 cosines = {title: [] for title in methods}
 units = []
 for s in seqs:
-    truth = frame.view(s).readout(labels)[:, 1:]  # [layer, position, label, hidden]
-    units.append((truth / truth.norm(dim=-1, keepdim=True).clamp_min(1e-30)).sum(1).double())
+    truth = frame.state(s).gradient(labels)[:, 1:]  # [layer, position, label, hidden]
+    units.append((truth / truth.norm(dim=-1, keepdim=True).clamp_min(1e-30)).sum(1).float().cpu())
     for title, method in methods.items():
         r = method(s)[:, 1:]
         c = torch.nn.functional.cosine_similarity(r, truth.to(r.device), dim=-1)
         cosines[title].append(c.mean((1, 2)).cpu().numpy())
-U = torch.stack(units)  # [sequence, layer, label, hidden]: each sequence's sum of unit readouts
+U = torch.stack(units)  # [sequence, layer, label, hidden]: each sequence's sum of unit gradients
 n = float(length - 1)
 kappa = ((U.sum(0) ** 2).sum(-1) - (U**2).sum((0, -1))) / ((len(seqs) * n) ** 2 - len(seqs) * n**2)
 bound = kappa.clamp_min(0).sqrt().mean(-1).cpu().numpy()  # [layer]: the mean over labels
@@ -170,7 +177,7 @@ for title, rows in cosines.items():
     (line,) = ax.plot(layers, a.mean(0), label=title)
     ax.fill_between(layers, *np.percentile(boot, [2.5, 97.5], 0), color=line.get_color(), alpha=0.2, linewidth=0)
 ax.set_xlabel("layer")
-ax.set_ylabel("cosine with the model's own readout")
+ax.set_ylabel("cosine with the model's own gradient")
 ax.set_ylim(0, 1.03)
 ax.xaxis.get_major_locator().set_params(integer=True)
 ax.legend(fontsize=8)
@@ -179,21 +186,20 @@ print("saved visualize_directions.png")
 
 # 6. Who wrote the answer, split into the attention and MLP sublayers of each layer, and what a steer does: move the
 # state at mid-depth or later from the answer toward the runner-up by a growing amount, then compare the change in
-# their coefficients that the readout predicts with the change in the model's own output, read in the native frame.
-attn = frame.attr(text, "attn", target=answer)[:, -1]
-mlp = frame.attr(text, "mlp", target=answer)[:, -1]
+# their logits that the gradient predicts with the change in the model's own output.
+attn, mlp = attribution[:, 1], attribution[:, 2]
 at = max(int(first), frame.num_layers // 2)
-s = frame.view(text, layers=at)
-o = s.readout([answer, rival])
-base = s.coef([answer, rival])[-1]
+c = state[at]  # every position at this layer
+o = c.gradient([answer, rival])
+base = c.decode().logits([answer, rival])[-1]
 sizes = np.linspace(0, 8, 17)
 predicted, actual, top = [], [], []
 for size in sizes:
-    moved = s.steer({answer: -size, rival: size})
-    predicted.append((o @ (moved - s).vector[..., None])[-1, :, 0].float().cpu().numpy())
-    out = frame.view(moved, frame="native")
-    actual.append((out.coef([answer, rival])[-1] - base).float().cpu().numpy())
-    top.append(out.tokens[-1][0])
+    moved = c.steer({answer: -size, rival: size})
+    predicted.append((o @ (moved.vector - c.vector)[..., None])[-1, :, 0].float().cpu().numpy())
+    out = moved.decode()  # with context: the model's output after the move
+    actual.append((out.logits([answer, rival])[-1] - base).float().cpu().numpy())
+    top.append(out.top(1)[0][-1, 0])
 predicted, actual = np.stack(predicted), np.stack(actual)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5), layout="constrained")
@@ -212,7 +218,7 @@ flips = [size for size, t in zip(sizes, top) if t != answer]
 if flips:
     ax2.axvspan(flips[0], sizes[-1], color="grey", alpha=0.15, label=f"model says {rival.strip()}")
 ax2.set_xlabel(f"steer from {answer.strip()} toward {rival.strip()} at layer {at}")
-ax2.set_ylabel("change in coefficient (centred logit)")
+ax2.set_ylabel("change in centred logit")
 ax2.set_title("steering: what the frame predicts and what the model does")
 ax2.legend(fontsize=8)
 fig.savefig("visualize_steering.png", dpi=150)

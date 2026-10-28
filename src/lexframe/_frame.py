@@ -1,5 +1,5 @@
-"""LexFrame: read the hidden state of every layer in the model's own vocabulary (the closure reading), account for what the context
-adds after each layer (the ledger), and measure, attribute and steer the state in the native frame."""
+"""LexFrame: the hidden states of a text decoded in the model's own vocabulary, with the directions that measure and move them (a State),
+and the trail of one prediction across layers and positions (a Trail)."""
 
 from __future__ import annotations
 
@@ -11,175 +11,289 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
-from . import _transport as TR
-from ._basis import basis as _solve_basis
-from ._basis import jvp as _jvp
-from ._calibrate import Calibration, calibrate, chunks, spread
-from ._closure import bucket, innovations, points, read
-from ._model import Model, block, eager, forward, kl, logprobs, own_attention, wrap
+from . import _state as S
+from . import _trail as TL
+from ._state import directions
+from ._calibrate import Calibration, calibrate, spread
+from ._model import Model, eigh, forward, kl, label_id, logprobs, wrap
+from ._transport import innovations, points, read_expected, run
 
-Text = str | Sequence[str] | torch.Tensor
-Token = int | str
-Layers = int | Iterable[int] | None
-FRAMES = ("closure", "native")
+Text = str | torch.Tensor
+Label = int | str
 CHECK_TEXT = "The quick brown fox jumps over the lazy dog."
+CHECK_TOL = 0.05  # nats within which the frame must reproduce the model (a warning otherwise)
+SOLVER = {"steps": 50, "damping": 0.1, "tol": 1e-3}  # direction(): LSMR to convergence, relative damping 0.1
+_UNSET = object()  # an argument of config() not given
+_DEFAULT = {"samples": 64, "tolerance": 0.02, "size": 1024, "cache": "", "progress": True}  # cache "": the default folder
 
 
-def _single(text) -> bool:
-    return isinstance(text, str) or (isinstance(text, torch.Tensor) and text.dim() == 1)
+def select(items: list, key) -> tuple[list, bool]:
+    """Index a list like a NumPy axis: an int (which drops the axis), a slice, or a list of ints. Returns (items, dropped)."""
+    if isinstance(key, (int, np.integer)) or (isinstance(key, torch.Tensor) and key.dim() == 0):
+        return [items[int(key)]], True
+    if isinstance(key, slice):
+        return items[key], False
+    return [items[int(i)] for i in key], False
 
 
-def _kind(frame: str) -> str:
-    if frame not in FRAMES:
-        raise ValueError(f"frame is 'closure' or 'native', not {frame!r}")
-    return frame
+class Decoding:
+    """What the selected states decode to, in the model's vocabulary. Returned by State.decode().
+
+    top(k): the k most probable labels and their probabilities, (labels, probs), each [..., k] (labels as text).
+    logits(labels): the labels' centred logits, [..., label]; without context, the centred log-probabilities that the state alone gives.
+    kl: the divergence from the model's own output, in nats, [...].
+    The leading axes are the State's: [layer, position], an axis dropped where it was indexed by an int."""
+
+    def __init__(self, state: State, context: bool):
+        self._s, self._context, self._top = state, context, None
+
+    def top(self, k: int = 5):
+        if self._top is None or self._top[0] < k:
+            s = self._s
+            f = s._frame
+            X = s._moved_list()
+            f._ready(calibrated=not self._context)
+            out = S.reading(f, s._xs, s._layers, X, s._positions, k, self._context)
+            ids, probs, div = (o[0].cpu().numpy() for o in out)
+            tok = f._m.tokenizer
+            labels = ids if tok is None else np.vectorize(lambda i: tok.decode([int(i)]), otypes=[object])(ids)
+            self._top = (k, labels, probs, div)
+        _, labels, probs, _ = self._top
+        return self._s._shape(labels[..., :k]), self._s._shape(probs[..., :k])
+
+    def logits(self, labels: Sequence[Label]) -> torch.Tensor:
+        s = self._s
+        f = s._frame
+        vs = torch.tensor([label_id(f._m, t) for t in labels], device=f._m.device)
+        if self._context:
+            f._ready(calibrated=False)
+            Wc = f._m.lm_head.weight[vs].float() - f._head_mean()
+            X = s._moved_list()
+            with torch.no_grad():
+                c = f._centred_logits(run(f._m, s._xs, s._layers, X, joint=X is not None, chunk=f._chunk), Wc)[:, 0][:, s._positions]
+        else:
+            c = S.expected_logits(f, s._xs, s._layers, s._moved_dict(), vs, s._positions)
+        return s._shape(c.detach())
+
+    @property
+    def kl(self) -> np.ndarray:
+        if self._top is None:
+            self.top(1)
+        return self._s._shape(self._top[3])
+
+    def __repr__(self) -> str:
+        return f"Decoding(context={self._context}, layers={self._s._layers}, positions={len(self._s._positions)})"
 
 
-class Carrier:
-    """The hidden states of one or more texts at one or more layers (layer num_layers is the output), with what the frame reads in
-    them.
+class State:
+    """The hidden states of a text, at every layer and position, with what they decode to and the directions that measure and move
+    them. Returned by LexFrame.state(); index it like an array, s[layer] or s[layer, position] (ints, slices or lists; layer
+    num_layers is the output).
 
-    vector: the states, [..., position, hidden]; tokens, ids, probs [..., position, k] and kl [..., position]: the reading, as NumPy
-    arrays, by default the closure reading (`reading` says which). first_layer() finds where a token first tops it. basis(),
-    readout() and coef() give the lexical basis, the lexical readout and the coefficients of given tokens (ids or single-token
-    strings such as " Paris") at the states of one text, in the native frame or, for readout() and coef(), the closure; gap() compares
-    the two readouts. Adding or subtracting a vector moves the states, and steer() moves them along the basis; a moved Carrier is
-    read again with frame.view(). A Carrier of chosen positions only (positions) holds its reading and nothing more.
-    """
+    vector: the selected states, [layer, position, hidden], an axis dropped where it was indexed by an int.
+    decode(context=True): what they decode to (a Decoding). With context, the states are carried through the remaining layers with the
+    true context: what the model outputs from them (for a moved state, after the move). Without, what each state carries by itself.
+    gradient(labels, context=True): the gradient of the labels' centred logits with respect to the states, [..., label, hidden]; its
+    inner product with a change of a state is the logit change, to first order.
+    direction(labels): for each label, a move that raises its logit by one and leaves the others' to first order, [..., label,
+    hidden].
+    coordinates(vector, labels): a change of the states written label by label, [..., label]: how far to move along each label's
+    direction to make the same first-order logit changes.
+    steer({label: change}): the states moved so that each label's logit changes by `change` (error and move report how well and how
+    far); state + vector and state - vector move them freely. Moved states decode, and give gradients, like any other."""
 
-    def __init__(
-        self, frame, vector, layers, ids, context, flags, moved=False, reading=None, positions=None, kind="closure"
-    ):
-        self.vector, self.layers, self.moved = vector, layers, moved
-        self._frame, self._ids, self._context, self._flags = frame, ids, context, flags
-        self.ids, self.probs, self.tokens, self.kl = reading or (None, None, None, None)
-        self.positions = positions
-        self.reading = kind if reading else None
+    def __init__(self, frame, ids, xs, layers, positions, squeeze=(False, False), X=None):
+        self._frame, self._ids, self._xs = frame, ids, xs
+        self._layers, self._positions, self._squeeze, self._X = layers, positions, squeeze, X
 
-    def _whole(self, what: str) -> None:
-        if self.positions is not None:
-            raise ValueError(f"{what} needs every position: view the text without positions=")
+    def __getitem__(self, key) -> State:
+        keys = key if isinstance(key, tuple) else (key,)
+        axes = [a for a in (0, 1) if not self._squeeze[a]]  # the axes still there: layer, position
+        if len(keys) > len(axes):
+            raise IndexError(f"too many indices: the State has {len(axes)} axes left")
+        sel = [self._layers, self._positions]
+        squeeze = list(self._squeeze)
+        for a, k in zip(axes, keys):
+            sel[a], squeeze[a] = select(sel[a], k)
+        if not sel[0] or not sel[1]:
+            raise IndexError("the selection is empty")
+        if any(b <= a for a, b in zip(sel[0], sel[0][1:])):
+            raise IndexError("select layers in increasing order, each once")
+        return State(self._frame, self._ids, self._xs, sel[0], sel[1], tuple(squeeze), self._X)
 
-    def basis(self, tokens: Sequence[Token]) -> torch.Tensor:
-        """The lexical basis of the tokens in the native frame, [..., position, token, hidden]: the move of the state that the
-        remaining layers, with the true context, turn into raising that token alone, scaled to raise its logit by one. Unmoved states
-        only."""
-        self._whole("the basis")
-        return self._frame._directions(self, tokens, "basis", "native")
+    @property
+    def layers(self) -> list[int]:
+        return list(self._layers)
 
-    def readout(self, tokens: Sequence[Token], frame: str = "native") -> torch.Tensor:
-        """The lexical readout of the tokens, [..., position, token, hidden]: in the native frame the gradient of each token's
-        centred output logit, so that its inner product with a displacement of the state is the logit change it predicts; in the
-        closure the gradient of the token's centred log reading."""
-        self._whole("the readout")
-        return self._frame._directions(self, tokens, "readout", _kind(frame))
+    @property
+    def positions(self) -> list[int]:
+        return list(self._positions)
 
-    def coef(self, tokens: Sequence[Token], frame: str = "native") -> torch.Tensor:
-        """The coefficients of the state on the tokens, [..., position, token]: their centred output logits when the state is
-        carried with its true context (native), or their centred log reading (closure)."""
-        self._whole("the coefficient")
-        return self._frame._directions(self, tokens, "coef", _kind(frame))
+    @property
+    def vector(self) -> torch.Tensor:
+        V = torch.stack([self._full(l)[0, self._positions] for l in self._layers]).float()
+        return self._shape(V)
 
-    def gap(self, tokens: Sequence[Token]) -> torch.Tensor:
-        """The frame gap of the tokens, [..., position, token]: one minus the cosine of the native readout with the closure readout.
-        It measures how much the context will still reinterpret the state."""
-        n, c = self.readout(tokens), self.readout(tokens, "closure")
-        return 1 - torch.nn.functional.cosine_similarity(n, c.to(n), dim=-1)
+    def decode(self, context: bool = True) -> Decoding:
+        return Decoding(self, context)
 
-    def steer(self, weights: Mapping[Token, float]) -> Carrier:
-        """The states moved along the lexical basis of each token by its weight, in logits, at every position, e.g.
-        {" Paris": -4, " London": 4}. Unmoved states of one text only."""
-        tokens = list(weights)
-        b = self.basis(tokens)
-        w = torch.tensor([float(weights[t]) for t in tokens], dtype=b.dtype, device=b.device)
-        return self + (b * w[:, None]).sum(-2)
+    def gradient(self, labels: Sequence[Label], context: bool = True) -> torch.Tensor:
+        f = self._frame
+        f._ready(calibrated=not context)
+        vs = torch.tensor([label_id(f._m, t) for t in labels], device=f._m.device)
+        if context:
+            Wc = f._m.lm_head.weight[vs].float() - f._head_mean()
+            g = S.coframe(f, self._xs, self._layers, Wc, self._moved_dict())[:, self._positions]
+        else:
+            g = S.expected_coframe(f, self._xs, self._layers, self._moved_dict(), vs, self._positions)
+        return self._shape(g.detach())
 
-    def first_layer(self, token: Token) -> np.ndarray:
-        """The first of the read layers at which the token tops the reading, [..., position]; -1 where it never does."""
-        if self.ids is None:
-            raise ValueError("a moved Carrier has no reading; read it with frame.view() first")
-        top = self.ids[..., 0] == self._frame.token_id(token)
-        top = top[..., None, :] if isinstance(self.layers, int) else top
-        layers = np.array(self._layer_list())
-        return np.where(top.any(-2), layers[top.argmax(-2)], -1)
+    def direction(self, labels: Sequence[Label]) -> torch.Tensor:
+        if self._X is not None:
+            raise ValueError("directions are taken at the model's own states, not at moved ones")
+        f = self._frame
+        f._ready(calibrated=False)
+        vs = torch.tensor([label_id(f._m, t) for t in labels], device=f._m.device)
+        Wc = f._m.lm_head.weight[vs].float() - f._head_mean()
+        return self._shape(directions(f, self._xs, self._layers, vs, Wc)[:, self._positions])
 
-    def _layer_list(self) -> list[int]:
-        return [self.layers] if isinstance(self.layers, int) else list(self.layers)
+    def coordinates(self, vector, labels: Sequence[Label]) -> torch.Tensor:
+        if self._X is not None:
+            raise ValueError("coordinates are taken at the model's own states, not at moved ones")
+        f = self._frame
+        f._ready(calibrated=False)
+        vs = torch.tensor([label_id(f._m, t) for t in labels], device=f._m.device)
+        R = self.gradient(labels)  # [..., label, hidden]
+        d = torch.as_tensor(vector.vector if isinstance(vector, State) else vector).to(R)
+        Rd = (R @ d[..., None])[..., 0]
+        G = S.output_pairing(f, self._xs, self._positions, vs)  # [position, label, label], the same at every layer
+        if self._squeeze[1]:
+            G = G[0]
+        return torch.linalg.solve(G.to(Rd), Rd[..., None])[..., 0]
 
-    def _canonical(self) -> torch.Tensor:
-        v = self.vector
-        single, one = self._flags
-        v = v[None] if one else v
-        return v[None] if single else v
-
-    def _moved(self, other, sign) -> Carrier:
-        self._whole("moving a state")
-        d = other.vector if isinstance(other, Carrier) else torch.as_tensor(other)
-        v = self.vector + sign * d.to(self.vector)
-        return Carrier(self._frame, v, self.layers, self._ids, self._context, self._flags, True)
+    def steer(self, changes: Mapping[Label, float]) -> State:
+        self._frame._ready(calibrated=False)
+        return S.steer(self, changes, self._frame._settings["tolerance"])
 
     def __add__(self, other):
-        return self._moved(other, 1)
+        return self._moved_by(other, 1)
 
     def __radd__(self, other):
-        return self._moved(other, 1)
+        return self._moved_by(other, 1)
 
     def __sub__(self, other):
-        return self._moved(other, -1)
+        return self._moved_by(other, -1)
 
     def __repr__(self) -> str:
-        extra = "" if self.positions is None else f", positions={self.positions}"
-        return f"Carrier(layers={self.layers}, shape={tuple(self.vector.shape)}, moved={self.moved}, reading={self.reading}{extra})"
+        return f"State(layers={self._layers}, positions={self._positions}, moved={self._X is not None})"
+
+    # ---- internals
+
+    def _full(self, l) -> torch.Tensor:
+        return self._xs[l] if self._X is None or l not in self._X else self._X[l]
+
+    def _shape(self, a):
+        """[layer, position, ...] with the axes indexed by an int dropped."""
+        if self._squeeze[1]:
+            a = a[:, 0]
+        if self._squeeze[0]:
+            a = a[0]
+        return a
+
+    def _moved_dict(self):
+        return None if self._X is None else {l: self._full(l) for l in self._layers}
+
+    def _moved_list(self):
+        return None if self._X is None else [self._full(l) for l in self._layers]
+
+    def _with(self, X) -> State:
+        merged = dict(self._X or {})
+        merged.update(X)
+        return State(self._frame, self._ids, self._xs, self._layers, self._positions, self._squeeze, merged)
+
+    def _moved_by(self, other, sign) -> State:
+        d = other.vector if isinstance(other, State) else torch.as_tensor(other)
+        d = d.to(self._xs[0].device).float()
+        shape = (len(self._layers), len(self._positions), self._xs[0].shape[-1])
+        if self._squeeze[1]:
+            d = d.unsqueeze(-2) if d.dim() >= 1 else d
+        if self._squeeze[0]:
+            d = d.unsqueeze(0) if d.dim() >= 2 else d
+        d = d.expand(shape)
+        X = {}
+        for i, l in enumerate(self._layers):
+            h = self._full(l).clone()
+            h[0, self._positions] = (h[0, self._positions].float() + sign * d[i]).to(h.dtype)
+            X[l] = h
+        return self._with(X)
 
 
-class Ledger:
-    """What the context adds to the reading of one position after each layer, for one target token, in log-probability units.
+class Trail:
+    """The trail of one prediction: how the model's output at one position comes about, for one label (by default the prediction
+    itself). Returned by LexFrame.trail().
 
-    logp [layer]: log R_k(target) for k = 0..num_layers, the closure reading of every layer (the last is the model's output), and prob
-    its exponent. step [layer]: log R_{j+1} - log R_j, the change that layer j makes, so log p_out - log R_k = step[k:].sum() exactly.
-    Each step is the innovation of layer j's attention write (the true write against its closure prediction) plus a noise term (the
-    closure's own spread at layer j): step = innovation + noise. sources [layer, position]: the innovation split by the position that
-    the attention read it from (integrated gradients along the straight path of the write), with residual = innovation - its sum
-    (None where the attention cannot be split). check: |the reading rebuilt from the true write - logp[j + 1]|, which must vanish.
-    Layer 0 is the embedding, for diagnosis; the reading starts at layer 1."""
+    label, position: the label (as text) and the position.
+    logprobs [layer + 1]: the label's log-probability decoded from the state of every layer by itself; the last is the model's output.
+    attribute() [layer, 3]: the change of the label's centred logit when what each layer wrote at this position is removed: the whole
+    write, its attention part and its MLP part.
+    upstream() [layer, position]: what each layer's attention brought in from each earlier position (None where the attention cannot
+    be split by source); each row adds up to what the context added at that layer.
+    downstream() [layer, later position]: what each later position's own prediction took from this position.
+    ablate(layer, part="all", source=None): the State after removing what the layer wrote here (part "attention" or "mlp" for one
+    sublayer), or, with a source position, the State after the layer runs again without what its attention read from that position;
+    decode it with context to see the model's output after the removal."""
 
-    def __init__(self, token, target, position, logp, innovation, noise, sources, residual, check):
-        self.token, self.target, self.position = token, target, position
-        self.logp, self.prob, self.step = logp, np.exp(logp), np.diff(logp)
-        self.innovation, self.noise, self.sources, self.residual, self.check = (
-            innovation,
-            noise,
-            sources,
-            residual,
-            check,
-        )
+    def __init__(self, frame, ids, position, label_id, label, logprobs):
+        self._frame, self._ids = frame, ids
+        self.position, self._v, self.label, self.logprobs = position, label_id, label, logprobs
+        self._up = None
+
+    def attribute(self) -> np.ndarray:
+        f, t = self._frame, self.position
+        pre = self._ids[:, : t + 1]
+        return np.stack([TL.attribute(f, pre, part, self._v)[:, t] for part in ("all", "attention", "mlp")], 1)
+
+    def upstream(self) -> np.ndarray | None:
+        if self._up is None:
+            self._up = TL.split(self._frame, self._ids, self.position, self._v)
+        return self._up["sources"]
+
+    def downstream(self) -> np.ndarray | None:
+        f, t, T = self._frame, self.position, self._ids.shape[1]
+        rows = []
+        for tp in range(t + 1, T):
+            sources = TL.split(f, self._ids, tp, None)["sources"]
+            if sources is None:
+                return None
+            rows.append(sources[:, t])
+        return np.stack(rows, 1) if rows else np.zeros((f.num_layers, 0))
+
+    def ablate(self, layer: int, part: str = "all", source: int | None = None) -> State:
+        f = self._frame
+        xs, h = TL.ablate(f._m, self._ids, self.position, layer, part, source)
+        return State(f, self._ids, xs, [layer + 1], list(range(self._ids.shape[1])), (True, False), {layer + 1: h})
 
     def __repr__(self) -> str:
-        return f"Ledger(token={self.token!r}, position={self.position}, layers={len(self.step)}, sources={self.sources is not None})"
+        return f"Trail(label={self.label!r}, position={self.position}, layers={len(self.logprobs) - 1})"
 
 
 class LexFrame:
-    """A lexical reference frame of a Hugging Face causal language model. It reads the hidden state of layer k at position t by the
-    closure: the state runs through the model's own remaining layers on its own column, with every attention write replaced by its
-    calibrated prediction plus a Gaussian innovation, averaged by quasi-Monte Carlo over `samples` points. Directions, attribution
-    and steering use the native frame: the model's own remaining layers with the true context. Call init() once before use.
-    """
+    """A frame of a Hugging Face causal language model: every hidden state read in the model's own vocabulary, by carrying it to the
+    output. With context, a state runs through the model's remaining layers with the true context. Without, it runs through them on
+    its own column, every attention write replaced by its expectation given the state plus a Gaussian innovation, averaged by
+    quasi-Monte Carlo.
 
-    def __init__(self, model, tokenizer=None, samples: int = 64, **removed):
-        if "order" in removed:
-            raise TypeError(
-                "order was removed in lexframe 1.3: view() gives the closure reading, which needs no order, and "
-                "view(..., frame='native') the exact transport that order='inf' gave"
-            )
-        if removed:
-            raise TypeError(f"unexpected arguments {sorted(removed)}")
+    config(...) sets the precision and the cost; init(texts) calibrates once; state(text) gives the states of a text, and trail(text)
+    the trail of one prediction."""
+
+    def __init__(self, model, tokenizer=None):
         self._m = model if isinstance(model, Model) else wrap(model, tokenizer)
         self.calibration: Calibration | None = None
-        self.identities: dict | None = None
+        self._identities: dict | None = None
         self._chunk = 8 if self._m.hidden_dim < 4000 else 6
-        self._rows = 1 << 15  # rows of one closure pass
-        self.solver = {"steps": 30, "ridge": 1e-3, "warm": False}
-        self.samples = _samples(samples)
+        self._rows = 1 << 15  # rows of one pass of the expected transport
+        self._solver = dict(SOLVER)
+        self._settings = dict(_DEFAULT)
         self._xi = None
 
     @property
@@ -188,438 +302,94 @@ class LexFrame:
         return self._m.n_layers
 
     def __repr__(self) -> str:
-        return f"LexFrame(model={type(self._m.hf).__name__}, layers={self._m.n_layers}, samples={self.samples})"
+        return f"LexFrame(model={type(self._m.hf).__name__}, layers={self._m.n_layers}, settings={self._settings})"
 
-    def config(
-        self,
-        steps: int | None = None,
-        ridge: float | None = None,
-        warm: bool | None = None,
-        samples: int | None = None,
-    ) -> LexFrame:
-        """Settings of the iterative LSMR solver behind basis(), kept in `frame.solver`: `steps` per layer (30), the relative `ridge`
-        that damps directions the remaining layers barely pass on (1e-3), and `warm` to start each layer from the solution of the
-        layer above (False); and the number of quasi-Monte Carlo `samples` of the closure reading (64)."""
-        new = {k: v for k, v in dict(steps=steps, ridge=ridge, warm=warm).items() if v is not None}
-        if "steps" in new and (not isinstance(new["steps"], int) or new["steps"] < 1):
-            raise ValueError("steps must be a positive integer")
-        if "ridge" in new and new["ridge"] < 0:
-            raise ValueError("ridge must not be negative")
+    def config(self, samples: int | None = None, tolerance: float | None = None, size: int | None = None, cache=_UNSET,
+               progress: bool | None = None) -> LexFrame:  # fmt: skip
+        """The frame with new settings. samples: integration points of the decoding without context (64; more is more accurate, at a
+        proportional cost). tolerance: the relative error at which steering stops (0.02). size: calibration sequences of 128 tokens
+        (1024). cache: the folder of calibrations (default ~/.cache/lexframe or $LEXFRAME_CACHE), or None for no cache. progress:
+        show the calibration's progress (True)."""
         if samples is not None:
-            self.samples, self._xi = _samples(samples), None
-        self.solver.update(new)
+            if not isinstance(samples, int) or samples < 1:
+                raise ValueError("samples must be a positive integer")
+            self._settings["samples"], self._xi = samples, None
+        if tolerance is not None:
+            if not 0 < tolerance < 1:
+                raise ValueError("tolerance must lie in (0, 1)")
+            self._settings["tolerance"] = float(tolerance)
+        if size is not None:
+            if not isinstance(size, int) or size < 2:
+                raise ValueError("size must be an integer of at least 2")
+            self._settings["size"] = size
+        if cache is not _UNSET:
+            self._settings["cache"] = cache
+        if progress is not None:
+            self._settings["progress"] = bool(progress)
         return self
 
-    def init(
-        self,
-        texts: Iterable,
-        size: int = 1024,
-        spread: bool = True,
-        cache: bool = True,
-        cache_dir: str | None = None,
-        tol: float = 0.05,
-        progress: bool = True,
-    ) -> LexFrame:
-        """Calibrate on unlabelled `texts`: `size` sequences of 128 tokens, one starting at each of `size` evenly spaced texts
-        (spread=True, when there are enough texts) or cut contiguously from the start; then check the exact identities. With
-        cache=True the calibration is stored under a fingerprint of the model's weights and configuration and the calibration
-        tokens, and loaded again when all of them match."""
-        batches = _batches(self._m, texts, size, spread)
-        path = os.path.join(_folder(cache_dir), _fingerprint(self._m, batches) + ".pt") if cache else None
+    def init(self, texts: Iterable) -> LexFrame:
+        """Calibrate on unlabelled `texts`: `size` sequences of 128 tokens, one from each of `size` evenly spaced texts (or batches of
+        token ids as tensors, used as given); then check that the frame reproduces the model. The calibration is cached under a
+        fingerprint of the model and the calibration tokens."""
+        st = self._settings
+        texts = list(texts)
+        batches = texts if texts and isinstance(texts[0], torch.Tensor) else spread(self._m, texts, st["size"])
+        folder = st["cache"]
+        if folder == "":
+            folder = os.environ.get("LEXFRAME_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "lexframe")
+        path = None if folder is None else os.path.join(folder, fingerprint(self._m, batches) + ".pt")
+        cal = None
         if path and os.path.exists(path):
-            cal = Calibration.load(path, self._m)
-        else:
-            cal = calibrate(self._m, batches, progress=progress)
+            try:
+                cal = Calibration.load(path, self._m)
+            except ValueError:  # a calibration made by another version is made again
+                cal = None
+        if cal is None:
+            cal = calibrate(self._m, batches, progress=st["progress"])
             if path:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 cal.save(path)
         self.calibration, self._xi = cal.to(self._m.device), None
-        self.identities = self._check(tol)
-        if not self.identities["ok"]:
-            warnings.warn(f"the frame does not reproduce the model within {tol} nats: {self.identities}")
+        self._stamp = _stamp(self._m)
+        self._identities = self._check(CHECK_TOL)
+        if not self._identities["ok"]:
+            warnings.warn(f"the frame does not reproduce the model within {CHECK_TOL} nats: {self._identities}")
         return self
 
     @torch.no_grad()
-    def view(
-        self,
-        x: Text | Carrier,
-        k: int = 1,
-        layers: Layers = None,
-        positions: int | Iterable[int] | None = None,
-        frame: str = "closure",
-    ) -> Carrier | list[Carrier]:
-        """The hidden states of one or more texts at every layer (or the given ones) with their reading, or the reading of a (moved)
-        Carrier. frame="closure" (default) is the closure reading, what each state carries by itself; frame="native" carries the
-        states to the output with their true context, which for unmoved states is the model's own output and for moved ones the
-        output after the move. positions reads only the given positions of a text, which is cut after the last of them. Texts of
-        different token lengths are read one at a time, and a list of Carriers is returned."""
-        kind = _kind(frame)
-        if positions is not None and not _is_int(positions):
-            positions = list(positions)
-        texts = self._ragged(x)
-        if texts is not None:
-            return [self.view(t, k, layers, positions, frame) for t in texts]
-        self._ready()
-        P = None
-        if isinstance(x, Carrier):
-            if positions is not None:
-                raise ValueError("a Carrier is read as it is: positions apply to texts")
-            if x.positions is not None:
-                raise ValueError("a Carrier of chosen positions holds its reading only: view the text again")
-            if x._frame._m.hf is not self._m.hf:
-                raise ValueError("this Carrier comes from another model")
-            if layers is not None:
-                raise ValueError("a Carrier is read at its own layers")
-            ids, xs, LS, flags = x._ids, x._context, x._layer_list(), x._flags
-            V = x._canonical()
-            X = [V[:, i].to(xs[l].dtype) for i, l in enumerate(LS)] if x.moved else None
-        else:
-            ids = self._m.ids(x)
-            if positions is not None:
-                P = chosen(positions, ids.shape[1])
-                ids = ids[:, : P[-1] + 1]
-            hL, xs, _ = forward(self._m, ids)
-            xs = xs + [hL]
-            LS = self._layers(layers)
-            flags = (_single(x), isinstance(layers, int))
-            V = torch.stack([xs[l] for l in LS], 1).float()
-            X = None
-        out = self._closure_reading(xs, LS, X, P, k) if kind == "closure" else self._native_reading(xs, LS, X, P, k)
-        out = [o.cpu().numpy() for o in out]
-        if P is not None:
-            V = V[:, :, P]
-        if flags[0]:
-            out, V = [o[0] for o in out], V[0]
-        if flags[1]:
-            out = [out[0][..., 0, :, :], out[1][..., 0, :, :], out[2][..., 0, :]]
-            V = V[..., 0, :, :]
-        vector = x.vector if isinstance(x, Carrier) else V
-        tok = self._m.tokenizer
-        tokens = None if tok is None else np.vectorize(lambda i: tok.decode([int(i)]), otypes=[object])(out[0])
-        moved = x.moved if isinstance(x, Carrier) else False
-        reading = (out[0], out[1], tokens, out[2])
-        return Carrier(self, vector, LS[0] if flags[1] else LS, ids, xs, flags, moved, reading, P, kind)
-
-    @torch.no_grad()
-    def attr(
-        self, text: Text, sublayer: str | None = None, target: Token | None = None
-    ) -> np.ndarray | list[np.ndarray]:
-        """How much each layer (or its `sublayer`, "attn" or "mlp") contributed to the logit of the token `target` (default: the
-        model's own prediction at every position), [layer, position]: the change of the target's centred output logit when what the
-        layer wrote at a position is removed there, in the native frame."""
-        if sublayer not in (None, "attn", "mlp"):
-            raise ValueError("sublayer is None (the whole layer), 'attn' or 'mlp'")
-        texts = self._ragged(text)
-        if texts is not None:
-            return [self.attr(t, sublayer, target) for t in texts]
-        self._ready()
-        ids = self._m.ids(text)
-        hL, xs, mid = forward(self._m, ids, mid=True)
-        L = self._m.n_layers
-        W = self._m.lm_head.weight.float()
-        top = (
-            (self._m.final_norm(hL).float() @ W.T).argmax(-1)
-            if target is None
-            else torch.full_like(ids, self.token_id(target))
-        )
-        Wd = W[top] - W.mean(0)
-        states = xs + [hL]
-        written = {
-            None: lambda k: states[k + 1] - xs[k],
-            "attn": lambda k: mid[k] - xs[k],
-            "mlp": lambda k: states[k + 1] - mid[k],
-        }[sublayer]
-        D = [written(k) for k in range(L)]
-        out = torch.empty(L, *ids.shape, device=self._m.device)
-        LS = list(range(1, L))
-        X = [(xs[l].float() - D[l - 1].float()).to(xs[l].dtype) for l in LS]
-        out[: L - 1] = self._coeff_rows(self._run(xs, LS), Wd) - self._coeff_rows(self._run(xs, LS, X), Wd)
-        out[L - 1] = self._coeff_rows(hL, Wd) - self._coeff_rows((hL.float() - D[L - 1].float()).to(hL.dtype), Wd)
-        out = out.transpose(0, 1).cpu().numpy()
-        return out[0] if _single(text) else out
-
-    def ledger(self, text: Text, target: Token | None = None, position: int = -1, steps: int = 8) -> Ledger:
-        """The ledger of one position of one text (the last by default) for the token `target` (default: the model's prediction):
-        how the closure reading of the target changes after each layer, split into the innovation of the layer's attention write
-        and a noise term, and the innovation split by source position with `steps` points of integrated gradients."""
-        self._ready()
-        m, cal = self._m, self.calibration
+    def state(self, text: Text) -> State:
+        """The hidden states of one text at every layer and position; index the State to select layers and positions."""
         ids = self._one(text)
-        t = chosen(position, ids.shape[1])[0]
-        if t == 0:
-            raise ValueError(
-                "position 0 attends only to itself: its reading is exact at every layer and it has no ledger"
-            )
-        ids = ids[:, : t + 1]
-        L, dev = m.n_layers, m.device
-        u_in, a_out = {}, {}
-
-        def cap(k, u, a):
-            u_in[k], a_out[k] = u[0], a[0, t]
-
-        hL, xs, _ = forward(m, ids, on_attention=cap)
-        out = logprobs(m, hL[0, t])
-        v = int(out.argmax()) if target is None else self.token_id(target)
-        xi, tt = self._points(), torch.tensor([t], device=dev)
-        with torch.no_grad():
-            R = read(
-                m, cal, {k: xs[k][0, t][None] for k in range(L)}, tt, xi, torch.tensor([v], device=dev), center=False
-            )
-        logp = np.array([float(R[k][0, 0]) for k in range(L)] + [float(out[v])])
-        innovation, noise, check, residual = np.zeros(L), np.zeros(L), np.zeros(L), np.zeros(L)
-        sources = np.zeros((L, t + 1))
-        split = True
-        alphas = ((torch.arange(steps, device=dev) + 0.5) / steps)[:, None]
-        for j in range(L):
-            ahat = cal.typical(j)(u_in[j][t][None], 0).float()[0] + cal.off[j, bucket(t)].to(dev)
-            a = a_out[j].float()
-            A = torch.cat([ahat[None], a[None], ahat + alphas * (a - ahat)]).requires_grad_(True)
-            with torch.enable_grad():
-                g = self._after(j, xs[j][0, t], A, t, xi, v)
-                grad = torch.autograd.grad(g[2:].sum(), A)[0][2:].mean(0)
-            g = g.detach()
-            check[j] = abs(float(g[1]) - logp[j + 1])
-            innovation[j], noise[j] = logp[j + 1] - float(g[0]), float(g[0]) - logp[j]
-            parts = self._sources(j, u_in[j], t, a) if split else None
-            if parts is None:
-                split = False
-                continue
-            C, w = parts
-            sources[j] = ((C - w[:, None] * ahat[None]) @ grad).cpu().numpy()
-            residual[j] = innovation[j] - sources[j].sum()
-        token = m.tokenizer.decode([v]) if m.tokenizer is not None else None
-        return Ledger(
-            token, v, t, logp, innovation, noise, sources if split else None, residual if split else None, check
-        )
-
-    def bound(self, texts: Iterable[Text], token: Token, layers: Layers = None) -> np.ndarray:
-        """The best mean cosine that any lens, with one direction per token and layer, can reach with the model's own readout of
-        `token`, per layer: sqrt of the native readout's agreement across at least two texts."""
-        sums, counts = [], []
-        for text in texts:
-            LS = list(range(self.num_layers)) if layers is None else layers
-            b = self._delta(self._one(text), [token], LS, "readout")[0][..., 0, :]
-            b = b / b.norm(dim=-1, keepdim=True).clamp_min(1e-30)
-            sums.append(b.sum(-2).double())
-            counts.append(b.shape[-2])
-        if len(sums) < 2:
-            raise ValueError("the bound needs at least two texts")
-        S = torch.stack(sums)
-        n = torch.tensor(counts, dtype=torch.float64)
-        kappa = ((S.sum(0) ** 2).sum(-1) - (S**2).sum((0, -1))) / (n.sum() ** 2 - (n**2).sum())
-        return kappa.clamp_min(0).sqrt().cpu().numpy()
-
-    def token_id(self, token: Token) -> int:
-        """The id of a token, given as an id or as a string that the tokenizer encodes to exactly one token."""
-        return token_id(self._m, token)
-
-    # ---- the closure
-
-    def _points(self) -> torch.Tensor:
-        """The innovations at the integration points, [samples, layer, hidden], computed once per calibration."""
-        if self._xi is None or self._xi.shape[0] != self.samples:
-            fac = self.calibration.fac
-            self._xi = innovations(fac, points(fac, self.samples), self._m.device)
-        return self._xi
-
-    def _closure_reading(self, xs, LS, X, P, k):
-        """Top-k ids and probabilities [B, layer, position, k] and the divergence from the output [B, layer, position]."""
-        m, L = self._m, self._m.n_layers
-        B, T, _ = xs[0].shape
-        Pt = list(range(T)) if P is None else list(P)
-        state = lambda i, l: (xs[l] if X is None else X[i])[:, Pt].reshape(B * len(Pt), -1)
-        ref = logprobs(m, xs[L][:, Pt]).reshape(B * len(Pt), -1)
-        t = torch.tensor(Pt, device=m.device).repeat(B)
-        N = t.shape[0]
-        inner = [(i, l) for i, l in enumerate(LS) if l < L]
-        res = {}
-        if inner:
-            xi = self._points()
-            n = max(1, self._rows // (self.samples * len(inner)))
-            for s in range(0, N, n):
-                lr = read(m, self.calibration, {l: state(i, l)[s : s + n] for i, l in inner}, t[s : s + n], xi)
-                for l, r in lr.items():
-                    top = r.topk(k, -1)
-                    res.setdefault(l, []).append((top.indices, top.values.exp(), kl(ref[s : s + n], r)))
-        if L in LS:
-            r = logprobs(m, state(len(LS) - 1, L))
-            top = r.topk(k, -1)
-            res[L] = [(top.indices, top.values.exp(), kl(ref, r))]
-        out = [torch.stack([torch.cat([p[j] for p in res[l]]) for l in LS]) for j in range(3)]
-        return [o.view(len(LS), B, len(Pt), *o.shape[2:]).transpose(0, 1) for o in out]
-
-    def _native_reading(self, xs, LS, X, P, k):
-        H = self._run(xs, LS, X)
-        ref = logprobs(self._m, xs[-1])
-        lps = [logprobs(self._m, h) for h in H]
-        top = [lp.topk(k, -1) for lp in lps]
-        out = [
-            torch.stack([t.indices for t in top], 1),
-            torch.stack([t.values.exp() for t in top], 1),
-            torch.stack([kl(ref, lp) for lp in lps], 1),
-        ]
-        return out if P is None else [o[:, :, P] for o in out]
-
-    def _closure_directions(self, xs, LS, X, vs, kind):
-        """Centred log readings of the tokens vs [layer, position, token] and, for kind 'readout', their gradients."""
-        m, L = self._m, self._m.n_layers
-        T = xs[0].shape[1]
-        t = torch.arange(T, device=m.device)
-        xi = self._points() if any(l < L for l in LS) else None
-        V = m.lm_head.weight.shape[0]
-        # a gradient keeps the probabilities of every draw: about 2 GB of them per chunk of positions
-        n = max(1, (self._rows // self.samples) if kind != "readout" else (1 << 29) // (self.samples * V * 4))
-        coefs, grads = [], []
-        for i, l in enumerate(LS):
-            h = (xs[l] if X is None else X[l])[0]
-            cs, gs = [], []
-            for s in range(0, T, n):
-                x = h[s : s + n].detach().float().requires_grad_(kind == "readout")
-                with torch.set_grad_enabled(kind == "readout"):
-                    if l < L:
-                        f = read(m, self.calibration, {l: x.to(h.dtype)}, t[s : s + n], xi, vs)[l]
-                    else:
-                        lp = logprobs(m, x.to(h.dtype))
-                        f = lp[:, vs] - lp.mean(-1, keepdim=True)
-                    if kind == "readout":
-                        r = len(vs)
-                        gs.append(
-                            torch.stack(
-                                [torch.autograd.grad(f[:, j].sum(), x, retain_graph=j < r - 1)[0] for j in range(r)], 1
-                            )
-                        )
-                cs.append(f.detach())
-            coefs.append(torch.cat(cs))
-            if kind == "readout":
-                grads.append(torch.cat(gs))
-        return torch.stack(coefs), (torch.stack(grads) if grads else None)
-
-    def _after(self, j, x, A, t, xi, v):
-        """log R_{j+1}(v) of the states that layer j makes from x [hidden] with the attention writes A [n, hidden]."""
-        m = self._m
-        h = block(m, j, x[None].expand(A.shape[0], -1).contiguous(), lambda u, s: A[s : s + u.shape[0]].to(u.dtype))
-        if j + 1 == m.n_layers:
-            return logprobs(m, h)[:, v]
-        tt = torch.full((A.shape[0],), t, device=m.device)
-        return read(m, self.calibration, {j + 1: h}, tt, xi, torch.tensor([v], device=m.device), center=False)[j + 1][
-            :, 0
-        ]
+        hL, xs, _ = forward(self._m, ids)
+        L = self._m.n_layers
+        return State(self, ids, xs + [hL], list(range(L + 1)), list(range(ids.shape[1])))
 
     @torch.no_grad()
-    def _sources(self, j, u, t, a):
-        """Layer j's attention write at position t split by source position, (C [position, hidden], w [position]) with C summing to
-        the write and w the head-averaged attention weights; None where the attention module does not allow the split.
-        """
-        m = self._m
-        at = own_attention(m, j)
-        o = getattr(at, "o_proj", None)
-        if not isinstance(o, torch.nn.Linear):
-            return None
-        n, dev, dt = t + 1, u.device, u.dtype
-        h = u[None, :n]
-        pe = m.position_embeddings(j, n)
-        got = {}
-        hook = o.register_forward_pre_hook(lambda _m, inp: got.__setitem__("ctx", inp[0]))
-        try:
-            with eager(m):
-                r = at(hidden_states=h, position_embeddings=pe, attention_mask=TR.causal(m, j, n, dev, dt))
-                weights = r[1] if isinstance(r, tuple) and len(r) > 1 else None
-                at(hidden_states=h, position_embeddings=pe, attention_mask=TR._mask(n, False, None, dev, dt))
-        finally:
-            hook.remove()
-        if weights is None or "ctx" not in got:
-            return None
-        alpha = weights[0, :, t, :n].float()
-        ctx = got["ctx"][0].float()
-        heads = alpha.shape[0]
-        if ctx.shape[-1] % heads:
-            return None
-        values = ctx.view(n, heads, -1)
-        C = (alpha.T[:, :, None] * values).reshape(n, -1) @ o.weight.float().T
-        w = alpha.mean(0)
-        if o.bias is not None:
-            C = C + w[:, None] * o.bias.float()
-        if float((C.sum(0) - a).norm() / a.norm().clamp_min(1e-30)) > 0.05:
-            return None
-        return C, w
-
-    # ---- the native frame
-
-    def _directions(self, x: Carrier, tokens, kind, frame) -> torch.Tensor:
+    def trail(self, text: Text, position: int = -1, label: Label | None = None) -> Trail:
+        """The trail of the prediction at one position of one text (the last by default), for `label` (default: the model's
+        prediction there)."""
         self._ready()
-        if not x._flags[0]:
-            raise ValueError("directions are taken at the states of one text")
-        if kind == "basis" and x.moved:
-            raise ValueError("the basis is taken at the model's own states, not at moved ones")
-        X = None
-        if x.moved:
-            V = x._canonical()
-            X = {l: V[:, i].to(x._context[l].dtype) for i, l in enumerate(x._layer_list())}
-        if frame == "closure":
-            vs = torch.tensor([self.token_id(t) for t in tokens], device=self._m.device)
-            LS = x._layer_list()
-            coef, vectors = self._closure_directions(x._context, LS, X, vs, kind)
-            one = isinstance(x.layers, int)
-            out = coef if kind == "coef" else vectors
-            return out[0] if one else out
-        vectors, coef = self._delta(x._ids, tokens, x.layers, kind, X)
-        return coef if kind == "coef" else vectors
-
-    def _delta(self, ids, tokens, layers, kind, X=None):
-        self._ready()
-        hL, xs, _ = forward(self._m, ids)
-        xs = xs + [hL]
+        ids = self._one(text)
         T = ids.shape[1]
-        one = isinstance(layers, int)
-        LS = self._layers(layers)
-        vs = torch.tensor([self.token_id(t) for t in tokens], device=self._m.device)
-        W = self._m.lm_head.weight.float()
-        Wc = W[vs] - W.mean(0)
-        Xl = None if X is None else [X[l] for l in LS]
-        with torch.no_grad():
-            coef = self._coeff(self._run(xs, LS, Xl), Wc)[:, 0]
-        vectors = None
-        if kind == "basis":
-            Y = (W[vs] @ self._gram_inverse())[:, None].expand(-1, T, -1).contiguous()
-            S = {}
-            scale = self._m.output_scale
+        if not -T <= position < T:
+            raise ValueError(f"position must lie in -{T}..{T - 1} for a text of {T} tokens")
+        t = position % T
+        if t == 0:
+            raise ValueError("position 0 attends only to itself: its decoding is exact at every layer and it has no trail")
+        m = self._m
+        L = m.n_layers
+        hL, xs, _ = forward(m, ids[:, : t + 1])
+        out = logprobs(m, hL[0, t])
+        v = int(out.argmax()) if label is None else label_id(self._m, label)
+        tt = torch.tensor([t], device=m.device)
+        R = read_expected(m, self.calibration, {k: xs[k][0, t][None] for k in range(L)}, tt, self._points(), torch.tensor([v], device=m.device),
+                 center=False)  # fmt: skip
+        lp = np.array([float(R[k][0, 0]) for k in range(L)] + [float(out[v])])
+        name = m.tokenizer.decode([v]) if m.tokenizer is not None else v
+        return Trail(self, ids, t, v, name, lp)
 
-            def save(l, X0, kv, x, rows):
-                gain = scale * (_jvp(self._m, l, kv, X0, x) * Wc[rows][:, None]).sum(-1)
-                S[(l, rows.start)] = x / gain[..., None]
-
-            cfg = self.solver
-            _solve_basis(self._m, xs, LS, Y, cfg["ridge"], cfg["steps"], save, cfg["warm"])
-            vectors = torch.stack([torch.cat([S[k] for k in sorted(S) if k[0] == l]) for l in LS]).transpose(1, 2)
-        elif kind == "readout":
-            vectors = self._readout(xs, LS, Wc, X)
-        if one:
-            coef = coef[0]
-            vectors = None if vectors is None else vectors[0]
-        return (None if vectors is None else vectors.detach()), coef.detach()
-
-    def _readout(self, xs, LS, Wc, X=None) -> torch.Tensor:
-        out = []
-        with torch.enable_grad():
-            for c in range(0, len(LS), self._chunk):
-                lv = [(xs[l] if X is None else X[l]).clone().requires_grad_(True) for l in LS[c : c + self._chunk]]
-                f = self._coeff(self._run(xs, LS[c : c + self._chunk], lv), Wc)
-                n = Wc.shape[0]
-                g = [torch.stack(torch.autograd.grad(f[..., i].sum(), lv, retain_graph=i < n - 1)) for i in range(n)]
-                out.append(torch.stack(g).float()[:, :, 0])
-        return torch.cat(out, 1).permute(1, 2, 0, 3)
-
-    def _run(self, xs, LS, X=None) -> torch.Tensor:
-        """The final states of the native transport of the layers LS, [len(LS), B, T, d] (layer L is the output itself)."""
-        L = self._m.n_layers
-        inner = [l for l in LS if l < L]
-        out = []
-        for c in range(0, len(inner), self._chunk):
-            Xc = None if X is None else X[c : c + self._chunk]
-            out.append(TR.native(self._m, xs, inner[c : c + self._chunk], Xc))
-        if L in LS:
-            out.append((xs[L] if X is None else X[len(inner)])[None])
-        return torch.cat(out)
+    # ---- checks and caches
 
     @torch.no_grad()
     def _check(self, tol: float) -> dict:
@@ -628,121 +398,110 @@ class LexFrame:
         hL, xs, _ = forward(m, ids)
         ref = logprobs(m, hL)
         L = m.n_layers
-        native = max(kl(ref, logprobs(m, h)).max() for h in self._run(xs, list(range(L))))
-        first = read(
-            m,
-            self.calibration,
-            {l: xs[l][0, :1] for l in range(L)},
-            torch.zeros(1, dtype=torch.long, device=m.device),
-            self._points(),
-        )
+        native = max(kl(ref, logprobs(m, h)).max() for h in run(m, xs, list(range(L)), chunk=self._chunk))
+        first = read_expected(m, self.calibration, {l: xs[l][0, :1] for l in range(L)}, torch.zeros(1, dtype=torch.long, device=m.device),
+                     self._points())  # fmt: skip
         first = max(kl(ref[0, :1], r).max() for r in first.values())
-        result = {"native_all_layers": float(native), "closure_first_position": float(first)}
+        result = {"visible_all_layers": float(native), "invisible_first_position": float(first)}
         result["ok"] = max(result.values()) < tol
         return result
 
-    def _ready(self) -> None:
+    def _ready(self, calibrated: bool = True) -> None:
+        """Refresh the caches if the weights changed; with calibrated=True, also require init()."""
+        stamp = _stamp(self._m)
+        if getattr(self, "_stamp", None) is not None and stamp[2] != self._stamp[2]:
+            # the model moved to another device: its tensors are new, its weights are not
+            self._m.pe.clear()
+            self.__dict__.pop("_gi", None)
+            self.__dict__.pop("_wbar", None)
+            self._stamp = None
         if self.calibration is None:
-            raise RuntimeError("call init(texts) first")
+            if calibrated:
+                raise RuntimeError("call init(texts) first: decoding without context and trails need the calibration")
+            if getattr(self, "_stamp", None) is not None and stamp[1] != self._stamp[1]:
+                self.__dict__.pop("_gi", None)
+                self.__dict__.pop("_wbar", None)
+            self._stamp = stamp
+            return
+        old = getattr(self, "_stamp", None)
+        if old is None:
+            self._stamp = stamp
+        elif stamp != old:
+            # the cached factors were measured on other weights: the output-side ones (head mean, head Gram) are recomputed, the
+            # expected transport's calibration needs init() again, and the native transport is recomputed on every call
+            if stamp[1] != old[1]:
+                self.__dict__.pop("_gi", None)
+                self.__dict__.pop("_wbar", None)
+            if stamp[0] != old[0]:
+                warnings.warn("the model's weights changed since init(): decoding without context uses the old calibration; call init() again")
+            self._stamp = (old[0], stamp[1], stamp[2])
         if self.calibration.ubar.device != self._m.device:
             self.calibration, self._xi = self.calibration.to(self._m.device), None
             self.__dict__.pop("_gi", None)
+            self.__dict__.pop("_wbar", None)
 
     def _one(self, text: Text) -> torch.Tensor:
         ids = self._m.ids(text)
         if ids.shape[0] != 1:
-            raise ValueError("this method takes one text at a time")
+            raise ValueError("one text at a time")
         return ids
 
-    def _ragged(self, x) -> list | None:
-        return ragged(self._m, x)
-
-    def _layers(self, layers: Layers) -> list[int]:
-        L = self._m.n_layers
-        LS = (
-            list(range(L + 1))
-            if layers is None
-            else sorted({int(l) for l in ([layers] if isinstance(layers, int) else layers)})
-        )
-        if not LS or LS[0] < 0 or LS[-1] > L:
-            raise ValueError(f"layers must lie in 0..{L} (layer {L} is the output)")
-        return LS
-
-    def _coeff(self, h, W):
+    def _centred_logits(self, h, W):
         return self._m.final_norm(h).float() * self._m.output_scale @ W.T
 
-    def _coeff_rows(self, h, Wd):
-        return (self._m.final_norm(h).float() * self._m.output_scale * Wd).sum(-1)
+    def _points(self) -> torch.Tensor:
+        """The innovations at the integration points, [samples, layer, hidden], computed once per calibration."""
+        n = self._settings["samples"]
+        if self._xi is None or self._xi.shape[0] != n:
+            fac = self.calibration.fac
+            self._xi = innovations(fac, points(fac, n), self._m.device)
+        return self._xi
 
     def _gram_inverse(self) -> torch.Tensor:
         if getattr(self, "_gi", None) is None:
-            W = self._m.lm_head.weight.double()
-            lam, U = torch.linalg.eigh(W.T @ W)
-            self._gi = (U / lam.clamp_min(lam.max() * 1e-10) @ U.T).float()
+            W, n = self._m.lm_head.weight, 1 << 14  # in row blocks: no float32 copy of the head
+            G = sum(W[i : i + n].float().T @ W[i : i + n].float() for i in range(0, W.shape[0], n))
+            lam, U = eigh(G)
+            self._gi = U / lam.clamp_min(lam.max() * 1e-6) @ U.T  # pseudo-inverse at float32 resolution
         return self._gi
 
-
-def _samples(n) -> int:
-    if not isinstance(n, int) or n < 1:
-        raise ValueError("samples must be a positive integer")
-    return n
-
-
-def token_id(m: Model, token: Token) -> int:
-    """The id of a token, given as an id or as a string that the tokenizer encodes to exactly one token."""
-    if not isinstance(token, str):
-        return int(token)
-    if m.tokenizer is None:
-        raise ValueError(f"a token given as the string {token!r} needs the tokenizer")
-    ids = m.tokenizer.encode(token, add_special_tokens=False)
-    if len(ids) != 1:
-        pieces = [m.tokenizer.decode([i]) for i in ids]
-        raise ValueError(f"{token!r} is {len(ids)} tokens, {pieces}; give a single token or its id")
-    return ids[0]
+    def _head_mean(self) -> torch.Tensor:
+        """The mean output-embedding row, in row blocks (no float32 copy of the head)."""
+        if getattr(self, "_wbar", None) is None:
+            W, n = self._m.lm_head.weight, 1 << 14
+            self._wbar = sum(W[i : i + n].float().sum(0) for i in range(0, W.shape[0], n)) / W.shape[0]
+        return self._wbar
 
 
-def ragged(m: Model, x) -> list | None:
-    """The texts of a batch whose token lengths differ, or None."""
-    if not isinstance(x, (list, tuple)) or len(x) < 2 or not all(isinstance(t, str) for t in x):
-        return None
-    if m.tokenizer is None:
-        return None
-    lengths = {len(m.tokenizer.encode(t, add_special_tokens=False)) for t in x}
-    return list(x) if len(lengths) > 1 else None
+def _stamp(m: Model) -> tuple:
+    """A cheap version stamp of the weights: (all parameters, the output head and final norm, the device). In-place updates
+    (optimiser steps, edits under no_grad) advance a tensor's version counter; reassigning a tensor changes its storage."""
+
+    def key(ps):
+        return tuple((p.data_ptr(), p._version) for p in ps)
+
+    hf = m.hf if hasattr(m, "hf") else None
+    params = list(hf.parameters()) if isinstance(hf, torch.nn.Module) else []
+    out = [m.lm_head.weight] + [p for p in getattr(m.final_norm, "parameters", lambda: [])()]
+    return key(params), key(out), m.device
 
 
-def chosen(positions, T: int) -> list[int]:
-    """Positions given as one index or several, possibly negative, as sorted indices into a text of T tokens."""
-    P = [positions] if _is_int(positions) else list(positions)
-    if not P or any(not -T <= int(p) < T for p in P):
-        raise ValueError(f"positions must lie in -{T}..{T - 1} for a text of {T} tokens")
-    return sorted({int(p) % T for p in P})
+FINGERPRINT_SAMPLES = 4096  # evenly spaced values of each parameter that the fingerprint hashes
 
 
-def _is_int(x) -> bool:
-    return isinstance(x, (int, np.integer)) or (isinstance(x, torch.Tensor) and x.dim() == 0)
+def fingerprint(m: Model, batches: list[torch.Tensor]) -> str:
+    """The cache key of a calibration: the model's configuration, each parameter's name, shape, dtype and an evenly spaced sample of
+    its values (exact bytes), and the calibration tokens."""
+    from . import __version__
 
-
-def _folder(cache_dir: str | None) -> str:
-    return cache_dir or os.environ.get("LEXFRAME_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "lexframe")
-
-
-def _batches(m: Model, texts, size: int, even: bool = True) -> list[torch.Tensor]:
-    texts = list(texts)
-    if texts and isinstance(texts[0], torch.Tensor):
-        return texts
-    return spread(m, texts, size) if even else list(chunks(m, texts, length=128, limit=size))
-
-
-def _fingerprint(m: Model, batches: list[torch.Tensor], shapes: bool = False) -> str:
-    h = hashlib.sha256(b"lexframe-calibration-2")
+    h = hashlib.sha256(f"lexframe-calibration-{__version__}".encode())
     h.update(m.hf.config.to_json_string(use_diff=False).encode())
     with torch.no_grad():
         for name, p in m.hf.named_parameters():
-            t = p.detach().double()
-            h.update(f"{name}|{tuple(p.shape)}|{p.dtype}|{float(t.sum()):.15e}|{float(t.square().sum()):.15e}".encode())
+            flat = p.detach().reshape(-1)
+            sample = flat[:: max(1, flat.numel() // FINGERPRINT_SAMPLES)][:FINGERPRINT_SAMPLES]
+            h.update(f"{name}|{tuple(p.shape)}|{p.dtype}|".encode())
+            h.update(sample.float().cpu().numpy().tobytes())
     for b in batches:
-        if shapes:
-            h.update(str(tuple(b.shape)).encode())
         h.update(b.cpu().long().numpy().tobytes())
     return h.hexdigest()[:32]
