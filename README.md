@@ -11,9 +11,9 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/jianguda/lexframe/main/assets/overview.gif" width="720" alt="LexFrame overview"></p>
 
-LexFrame reads a hidden state the way the model reads it, in the model's own vocabulary.
-It is **model-native**: the state runs through the model's own remaining layers, with nothing fitted to the output.
-It is **context-aware**: it separates what the state carries by itself from what the context adds later, layer by layer and position by position.
+LexFrame reads every hidden state of a language model, at every layer and position, in the model's own vocabulary: its logits, its gradients, and the semantic bases that carry both, for every label.
+It is **model-native**: the state runs through the model's own remaining layers, calibrated once on unlabelled text, with nothing fitted to the output.
+It is **context-aware**: it separates what the state carries by itself from what the context adds later, and steers or ablates the model's run with the full context, carrying every move forward to the output.
 
 ## Quickstart
 
@@ -27,22 +27,21 @@ import lexframe as lf
 frame = lf.LexFrame(model, tokenizer).init(texts)            # a loaded Hugging Face model and any unlabelled texts
 text = "The Eiffel Tower is located in the city of"
 s = frame.state(text)                                        # the hidden states of every layer and position
-s[:, -1].decode(context=False).top(5)                        # decode: the top 5 labels that each layer's state carries
-t = frame.trail(text)                                        # trail: where the prediction " Paris" comes from
-t.attribute(), t.upstream()                                  # what each layer contributed, and from which positions
+s[:, -1].logits().softmax(-1).topk(5)                        # logits: the top 5 labels that each layer's state carries
 moved = s[16, -1].steer({" Paris": -4, " London": 4})        # steer: move layer 16 from Paris toward London
-moved.decode().top(5)                                        # the model's output after the move
+moved[-1, -1].logits().softmax(-1).topk(5)                   # the model's output after the move
+s[13, -1].ablate()[-1, -1].logits().softmax(-1).topk(5)      # ablate: the output without layer 12's write at the last position
+b = s[16, -1].basis([" Paris", " London"])                  # basis: the labels' semantic bases at a state (None: all)
 ```
 
-[docs/USAGE.md](https://github.com/jianguda/lexframe/blob/main/docs/USAGE.md) lists every command, and [examples/walkthrough.py](https://github.com/jianguda/lexframe/blob/main/examples/walkthrough.py) puts them to work: where SmolLM3 decides that the Eiffel Tower is in Paris, who wrote that decision, and how to change it. [examples/visualize.py](https://github.com/jianguda/lexframe/blob/main/examples/visualize.py) plots every layer's reading and where the state sits in the frame, layer by layer. The examples need `pip install "lexframe[demo]"`. To try LexFrame without installing anything, [open the quickstart in Colab](https://colab.research.google.com/github/jianguda/lexframe/blob/main/examples/quickstart.ipynb).
+[docs/USAGE.md](https://github.com/jianguda/lexframe/blob/main/docs/USAGE.md) describes every command, from logits, gradients and semantic bases to steering and ablation, and [examples/walkthrough.py](https://github.com/jianguda/lexframe/blob/main/examples/walkthrough.py) puts them to work: where SmolLM3 decides that the Eiffel Tower is in Paris, who wrote that decision, and how to change it. [examples/visualize.py](https://github.com/jianguda/lexframe/blob/main/examples/visualize.py) plots every layer's logits and where the state sits among the semantic bases. Explore LexFrame directly with the [quickstart in Colab](https://colab.research.google.com/github/jianguda/lexframe/blob/main/examples/quickstart.ipynb).
 
 ## Mechanism
 
-Lenses such as the logit lens and the Jacobian lens read every state of a layer with one fixed map. LexFrame carries each state to the output through the model's remaining layers and reads it there: with context, as the model runs; without context, with every later attention write replaced by its expectation given the state, which shows what the state carries by itself. A trail follows one prediction across layers and tells what the context brought in at each layer and from which positions. [docs/MECHANISM.md](https://github.com/jianguda/lexframe/blob/main/docs/MECHANISM.md) explains the details.
+LexFrame carries each state through the model's own remaining layers and reads it at the output. Other positions enter a layer only through its attention write, so every later write is replaced by its expectation given the state, calibrated once on unlabelled text: the logits are what the state carries by itself. The gradients are the model's own, and the semantic bases carry both: a state is the sum of the bases of the whole vocabulary weighted by its logits, and a move along a label's basis changes that label's logit by the step, to first order. Steering rotates a state at its norm so that chosen labels' logits change by given amounts and the other labels change least; ablation removes what a layer, a sublayer or one source position wrote; both run the model itself with the full context. Lenses instead read every state of a layer with one fixed map. [docs/MECHANISM.md](https://github.com/jianguda/lexframe/blob/main/docs/MECHANISM.md) explains the details.
 
-<p align="center"><img src="https://raw.githubusercontent.com/jianguda/lexframe/main/assets/lenses-qwen.png" width="900" alt="The top token each method reads in Qwen3-0.6B"></p>
-<p align="center"><img src="https://raw.githubusercontent.com/jianguda/lexframe/main/assets/lenses-minicpm.png" width="900" alt="The top token each method reads in MiniCPM5-1B"></p>
-<p align="center"><sub>The top token that each method reads at every second layer of Qwen3-0.6B (top) and MiniCPM5-1B (bottom), shaded by its probability, with the Jacobian lens fitted on 100 sequences. At the last position, LexFrame reads " Paris" from layer 16 in MiniCPM5-1B, while both lenses read it only from layer 18 or later; in Qwen3-0.6B all three read it from layer 22.</sub></p>
+<p align="center"><img src="https://raw.githubusercontent.com/jianguda/lexframe/main/assets/lenses-olmo.png" width="900" alt="The top token each method reads in OLMo3-7B"></p>
+<p align="center"><sub>The top token each method reads at every second layer of OLMo3-7B, for "The Space Needle is located in the city of" after the document start, shaded by its probability (Jacobian lens fitted on 100 sequences). The model answers " Seattle" (0.43). At the last position, LexFrame reads " Seattle" from layer 20, the Jacobian lens from layer 22 and the logit lens from layer 24.</sub></p>
 
 ## Compatibility
 

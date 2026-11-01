@@ -1,7 +1,6 @@
 """LexFrame next to two baselines, the logit lens and the Jacobian lens, on SmolLM3: the top token that each reads at
-every second layer and every position (baselines_tokens.png), and, as in the paper, how far each reading lies from the
-model's own output, layer by layer (baselines_divergence.png). examples/visualize.py compares their gradients. Needs
-matplotlib."""
+every second layer and every position (baselines_tokens.png), and, as in the paper, how far each method's logits lie from the
+model's own output, layer by layer (baselines_divergence.png). Needs matplotlib."""
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
@@ -41,23 +40,22 @@ def label(token: str, width: int = 6) -> str:
     return text if len(text) <= width else text[: width - 1] + "."
 
 
-def decoding(method, text, layers=slice(None)):
-    """What a method reads from the states of `text` at `layers`: a lens its own decoding, LexFrame the reading without
-    context, what each state carries by itself."""
-    s = method.state(text)[layers]
-    return s.decode(context=False) if method is frame else s.decode()
+def logprobs_of(method, text, layers=slice(None)):
+    """What a method reads from the states of `text` at `layers`, as log-probabilities [layer, position, vocabulary]: a lens its own
+    decoding, LexFrame what each state carries by itself."""
+    return method.state(text)[layers].logits().float().log_softmax(-1).cpu()
 
 
-# 1. The top token of each reading at every second layer and every position, shaded by its probability.
+# 1. The top token of each method at every second layer and every position, shaded by its probability.
 rows = sorted(set(range(0, L + 1, 2)) | {L})
 words = [label(tokenizer.decode([i])) for i in tokenizer.encode(text, add_special_tokens=False)]
 fig, axes = plt.subplots(1, 3, figsize=(18, 8), sharey=True, layout="constrained")
 for ax, (title, method) in zip(axes, methods.items()):
-    tokens, probs = decoding(method, text, rows).top(1)
-    image = ax.imshow(np.nan_to_num(probs[..., 0]), aspect="auto", origin="lower", cmap=sand, vmin=0, vmax=1, alpha=0.8)
-    for (row, position), token in np.ndenumerate(tokens[..., 0]):
-        if not np.isnan(probs[row, position, 0]):  # a lens that does not read a layer gives "" and NaN there
-            ax.text(position, row, label(token), ha="center", va="center", fontsize=8)
+    p, ids = logprobs_of(method, text, rows).exp().max(-1)
+    probs = p.numpy()
+    image = ax.imshow(probs, aspect="auto", origin="lower", cmap=sand, vmin=0, vmax=1, alpha=0.8)
+    for (row, position), i in np.ndenumerate(ids.numpy()):
+        ax.text(position, row, label(tokenizer.decode([int(i)])), ha="center", va="center", fontsize=8)
     ax.set_xticks(range(len(words)), words, rotation=45, ha="right")
     ax.set_title(title)
 axes[0].set_yticks(range(len(rows)), rows)
@@ -66,17 +64,20 @@ fig.colorbar(image, ax=axes, label="probability of the top token", shrink=0.6)
 fig.savefig("baselines_tokens.png", dpi=150)
 print("saved baselines_tokens.png")
 
-# 2. The divergence in nats of each reading from the model's output, per layer, as a mean over the positions of a few
-# sequences. The reading without context is not fitted to the output: it is what each state carries by itself, so its divergence
-# measures what the context has yet to add, and it reaches zero only at the output.
-readers = {"logit lens": methods["logit lens"], "Jacobian lens": methods["Jacobian lens"], "LexFrame": frame}
+# 2. The divergence in nats of each method's logits from the model's output, per layer, as a mean over the positions of a few
+# sequences. LexFrame's logits are not fitted to the output: they are what each state carries by itself, so their divergence measures
+# what the context has yet to add, and it reaches zero only at the output.
 length, count = 64, 8  # tokens per sequence and sequences
 seqs = [torch.tensor(i[:length]) for i in (tokenizer.encode(t, add_special_tokens=False) for t in texts[:1000])]
 seqs = [s for s in seqs if len(s) == length][:count]
 
 fig, ax = plt.subplots(figsize=(7, 4.5), layout="constrained")
-for title, reader in readers.items():
-    divergence = np.mean([decoding(reader, s, slice(0, L)).kl.mean(-1) for s in seqs], 0)  # the output itself has none
+for title, reader in methods.items():
+    def kl(s):  # [layer]: the divergence of each layer's logits from the output, averaged over the positions
+        lp = logprobs_of(reader, s)
+        return (lp[L].exp() * (lp[L] - lp[:L])).sum(-1).mean(-1).numpy()
+
+    divergence = np.mean([kl(s) for s in seqs], 0)  # the output itself has none
     ax.plot(range(L), np.where(divergence > 1e-8, divergence, np.nan), label=title)
 ax.set_yscale("log")
 ax.set_xlabel("layer")

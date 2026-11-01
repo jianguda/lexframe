@@ -1,29 +1,32 @@
 # Usage
 
-A frame is built on a loaded Hugging Face model and gives two objects:
-- a **State**: the hidden states of a text at every layer and position. It tells what they decode to, how a change of them would move
-  given logits, and how to move them.
-- a **Trail**: one prediction, followed across layers and positions. It tells where the prediction comes from and what the position
-  passes on.
+A frame is built on a loaded Hugging Face causal language model. `frame.state(text)` gives a **State**: the hidden states of the
+text at every layer and position. A State gives three quantities and moves the model's run:
+- `logits`: what each state carries in the model's vocabulary (calibrated once by `init`; at the output layer, the model's own);
+- `gradient`: how the model's output responds to a change of each state;
+- `basis`: the semantic bases, the geometric carrier of both: a state's projections on them are its logits, and their covectors
+  are the gradients;
+- `steer`, `ablate`, `+`, `-`: the moved run, a State like any other, whose output layer is the model's output after the move.
+
+[MECHANISM.md](MECHANISM.md) gives the definitions and the computations.
 
 ```python
 import lexframe as lf
 
-frame = lf.LexFrame(model, tokenizer).init(texts)            # calibrate once on unlabelled texts
+frame = lf.LexFrame(model, tokenizer).init(texts)             # calibrate once on unlabelled texts
 text = "The Eiffel Tower is located in the city of"
 
-s = frame.state(text)                                         # every layer and position; index like an array
-s[16, -1].decode().top(5)                                     # what the model outputs from layer 16's state at the last position
-s[16, -1].decode(context=False).top(5)                        # what that state carries by itself
-s[16, -1].gradient([" Paris", " London"])                     # how a change of the state moves each label's logit
-moved = s[16, -1].steer({" Paris": -2, " London": 2})         # Paris loses two logits, London gains two
-moved.decode().top(5)                                         # the model's output after the move
-s[16, -1].coordinates(s[17, -1].vector - s[16, -1].vector, [" Paris", " London"])  # what layer 16 wrote, label by label
+s = frame.state(text)                                          # every layer and position; index like an array
+s[16, -1].logits().softmax(-1).topk(5)                         # what layer 16's state at the last position carries
+s[-1, -1].logits().softmax(-1).topk(5)                         # at the output layer: the model's own prediction
+s[16, -1].gradient([" Paris", " London"])                      # how a change of the state moves each label's output logit
+b = s[16, -1].basis([" Paris", " London"])                     # the labels' semantic bases at the state
 
-t = frame.trail(text)                                         # the prediction at the last position
-t.logprobs                                                    # its log-probability from every layer's state by itself
-t.attribute(), t.upstream(), t.downstream()                   # by layer; from which positions; to which positions
-t.ablate(12, "attention").decode().top(5)                     # the output without layer 12's attention write here
+moved = s[16, -1].steer({" Paris": -2, " London": 2})          # the run moved at layer 16: Paris loses two logits, London gains two
+moved[-1, -1].logits().softmax(-1).topk(5)                     # the model's output after the move
+cut = s[13, -1].ablate("attention")                            # the run without layer 12's attention write at the last position
+s[-1, -1].logits([" Paris"]) - cut[-1, -1].logits([" Paris"])  # what that write did to the prediction
+s[13, -1].ablate(source=6)                                     # the run with layer 12's attention not reading position 6 there
 ```
 
 ## LexFrame
@@ -31,81 +34,85 @@ t.ablate(12, "attention").decode().top(5)                     # the output witho
 | Command | Returns |
 |---|---|
 | `LexFrame(model, tokenizer)` | a frame of a Hugging Face causal language model |
-| `frame.config(samples=64, tolerance=0.02, size=1024, cache=..., progress=True)` | the frame with new settings (see below) |
+| `frame.config(samples=64, size=1024, length=256, cache=..., progress=True)` | the frame with new settings (see below) |
 | `frame.init(texts)` | the frame, calibrated on unlabelled `texts` (strings, or batches of token ids as tensors, used as given) |
 | `frame.num_layers` | the number of layers; layer `num_layers` is the output |
-| `frame.state(text)` | a `State` of one text at every layer and position |
-| `frame.trail(text, position=-1, label=None)` | a `Trail` of the prediction at one position, for `label` (default: the model's prediction there) |
+| `frame.state(text)` | the `State` of a text (a string or token ids) at every layer and position |
 
 | Setting | Default | Effect |
 |---|---|---|
-| `samples` | 64 | integration points of decoding without context: more is more accurate, at a proportional cost |
-| `tolerance` | 0.02 | the relative error at which `steer` stops |
-| `size` | 1024 | calibration sequences of 128 tokens |
+| `samples` | 64 | integration points of `logits`: more is more accurate, at a proportional cost |
+| `size` | 1024 | calibration sequences |
+| `length` | 256 | tokens per calibration sequence |
 | `cache` | `$LEXFRAME_CACHE` or `~/.cache/lexframe` | the folder of calibrations; `None` for no cache |
 | `progress` | `True` | show the calibration's progress |
 
 ## State
 
-Index a `State` like an array: `s[layer]` or `s[layer, position]`, with ints (which drop the axis), slices or lists of ints; layers
+Index a `State` like an array: `s[layer]` or `s[layer, position]`, with ints (which drop the axis), slices or lists of ints. Layers
 are selected in increasing order, each once. Results have the leading axes `[layer, position]` of the selection.
 
 | Member | Returns |
 |---|---|
-| `vector`, `layers`, `positions` | the selected hidden states `[layer, position, hidden]`, and their layers and positions |
-| `decode(context=True)` | a `Decoding`: `top(k)` gives the k most probable labels and their probabilities, `logits(labels)` the labels' centred logits, `kl` the divergence from the model's output. With context: what the model outputs from the states, carried through the remaining layers with the true context. Without context: what each state carries by itself |
-| `gradient(labels, context=True)` | the gradient of each label's centred logit with respect to the states, `[..., label, hidden]`, with or without context; its inner product with a change of a state is the logit change, to first order |
-| `direction(labels)` | for each label, a move of the states that raises its logit by one and leaves the others' to first order, `[..., label, hidden]` |
-| `coordinates(vector, labels)` | a change of the states written label by label, `[..., label]`: how far to move along each label's direction to make the same first-order logit changes; `vector` is `[..., hidden]` or a `State` |
-| `steer({label: change})` | the states moved so that each label's logit changes by `change`; `error` and `move` report, per selected state, the relative error and the size of the move relative to the state |
-| `state + v`, `state - v` | the selected states moved by `v` |
+| `vector` | the selected hidden states, `[..., hidden]` |
+| `layers`, `positions` | the selected layers and positions |
+| `logits(labels=None)` | what the states carry: centred logits `[..., label]` (`None`: the whole vocabulary). At the output layer, the model's own centred logits |
+| `gradient(labels)` | the model's own gradient of each label's centred output logit with respect to the states, the context fixed, `[..., label, hidden]` |
+| `basis(labels)` | the labels' semantic bases at the states, `[..., label, hidden]` (`None`: the whole vocabulary): the state is the sum of the bases of the whole vocabulary weighted by its logits, and a move along a label's basis changes its output logit by the step, to first order |
+| `steer({label: change})` | the run moved at the selected positions of one layer so that each label's centred output logit changes by `change`, to a relative error of 2%: each state rotated at its norm, the output's distribution over the other labels changed least |
+| `ablate(part="all", source=None)` | the run without what the previous layer wrote at the selected positions of one layer (`part` `"attention"` or `"mlp"` for one sublayer), or, with a `source` position, with that layer run again without what its attention read from there |
+| `state + v`, `state - v` | the run with the selected states moved by `v` |
 
-Moved states decode and give gradients like any others. `direction`, `coordinates` and `steer` start from the model's own states and
-refuse moved ones.
+A moved run is the model with the move added, and every member works on it at every layer. A further move, at any layer, keeps the
+earlier moves as the changes they made.
 
-## Trail
+Everything else follows from these members: probabilities, rankings and divergences from `logits`, and how well and how far a move
+went from the moved run:
 
-| Member | Returns |
-|---|---|
-| `label`, `position` | the label as text, and the position |
-| `logprobs` | the label's log-probability from every layer's state by itself (decoded without context), `[layer + 1]`; the last is the model's output |
-| `attribute()` | the change of the label's centred logit when what each layer wrote at this position is removed: the whole write, its attention part and its MLP part, `[layer, 3]` |
-| `upstream()` | what each layer's attention brought in from each earlier position, `[layer, position]`; a row adds up to how much the context raised the label at that layer beyond what the state predicted by itself |
-| `downstream()` | what each later position's own prediction took from this position, `[layer, later position]` |
-| `ablate(layer, part="all", source=None)` | the `State` at layer `layer + 1` with what layer `layer` wrote here removed (`part` `"attention"` or `"mlp"` for one sublayer), or, with a `source` position, after the layer runs again without what its attention read from there |
+```python
+moved = s[16, -1].steer({" Paris": -2, " London": 2})
+done = moved[-1, -1].logits([" Paris", " London"]) - s[-1, -1].logits([" Paris", " London"])  # the changes made
+size = (moved[16, -1].vector - s[16, -1].vector).norm() / s[16, -1].vector.norm()           # the move, relative to the state
+```
 
 ## Notes
 
 **Labels and layers.** Labels are vocabulary entries, given as ids or as strings that encode to exactly one token, such as `" Paris"`;
-a string of several tokens is refused. Layers run from 0, the embedding, to `num_layers`, the output. Decoding without context starts
-at layer 1; layer 0 is shown for diagnosis.
+a string of several tokens is refused. Layers run from 0, the embedding, to `num_layers`, the output. `logits` start at layer 1;
+layer 0 is shown for diagnosis.
 
-**Calibration.** Decoding without context and trails need `init`; everything with context does not.
-- `init` uses `size` sequences of 128 tokens, one from each of `size` evenly spaced texts, so pass the whole corpus (e.g. all of
-  WikiText-103's training split) rather than its first lines.
+**Calibration.** `logits` below the output layer, and so `basis`, need `init`; `gradient` and the moves do not.
+- `init` uses `size` sequences of `length` tokens, one from each of `size` evenly spaced texts, so pass the whole corpus (e.g. all
+  of WikiText-103's training split) rather than its first lines.
+- The position statistics cover the first `length` positions; later positions read with those of the last positions seen.
 - It takes two passes over the sequences and is cached under a fingerprint of the model and the calibration tokens.
 - It warns if the frame does not reproduce the model.
 
-**Decoding.** Without context, a state's decoding depends on the state and its position alone, and it is deterministic: the
-integration points are fixed. With context, the model's own states decode to the model's own output at every layer, and moved states
-to the output after the move, with every moved position carried together.
+**Logits.** A state's logits depend on the state and its position alone, and they are deterministic: the integration points are
+fixed. At position 0, which sees only itself, they are the model's output at every layer.
 
-**Steering.** `steer` changes each label's logit by its `change` at every selected position and layer, and leaves the other positions
-as they are. It cancels the cross-talk between related labels and the logits' response beyond first order. The error is measured on
-the model's own forward pass; where one step does not reach `tolerance`, `steer` approaches it in steps.
+**Bases.** A label's basis is the same whatever other labels are asked for. A move along one basis also moves the other labels'
+logits a little; to change some labels and spare the rest, use `steer`.
 
-**Trail.** `upstream` and `downstream` need the attention module's weights and an output projection `o_proj`. Where the attention
-output cannot be rebuilt from its weights and values (e.g. with attention sinks, whose weights do not sum to one), they return `None`,
-and `ablate` with a `source` is refused.
+**Steering.** `steer` leaves the other positions as they are. A change beyond the reach of a rotation stops short, with a warning
+that names the largest relative error.
+
+**Ablation by source.** `ablate` with a `source` needs the attention module's weights and an output projection `o_proj`. Where the
+attention output cannot be rebuilt from its weights and values (e.g. with attention sinks, whose weights do not sum to one), it is
+refused.
 
 **Cost.**
-- Decoding without context runs `samples` single-position columns through the remaining layers for each selected state; select layers
-  and positions to read less.
-- `gradient` adds one backward pass per label; `direction` up to fifty pairs of forward and backward passes per layer; `coordinates`
-  one gradient and the final norm's Jacobian at each position; `steer` one direction and gradient per step and layer.
-- A trail decodes its label at every layer. `attribute` carries every layer's state, with its write removed, through the remaining
-  layers, once for the whole write and once for each sublayer; `upstream` takes about ten decodings per layer, and `downstream` an
-  `upstream` per later position.
+- `logits` runs `samples` single-position columns through the remaining layers for each selected state. `logits()` of every
+  layer and position holds layers × positions × vocabulary floats: select layers, positions or labels to read less.
+- `gradient` is one backward pass through the remaining layers, all labels together.
+- `basis` takes the logits of the whole vocabulary, the Jacobian of the final normalisation's output (one backward pass per hidden
+  dimension) and one system of the hidden size per state, whatever the labels asked for; the whole vocabulary's bases of one state
+  are vocabulary × hidden floats.
+- `steer` takes, per linearisation, that Jacobian and the others' Fisher metric (one pass over the head), and per step one backward
+  pass for the gradients and one forward pass from the moved layer. The selected positions are solved one after another.
+- `ablate` runs the ablated layer once more on the run's states; it, `+` and `-` then run one forward pass from the moved layer.
+- A moved run keeps one `[positions, hidden]` change per moved layer.
 - The calibration holds three `[hidden, hidden]` tables per layer (about 0.6 GB for a 1B model, 6 GB for a 7B one), kept on the CPU
   when large.
-- LexFrame's own computations run in float32 and need no float64, so any accelerator works, Apple's MPS included.
+- The model's layers run in the model's own precision (e.g. bfloat16); its final normalisation and head, and LexFrame's own
+  computations, run in float32.

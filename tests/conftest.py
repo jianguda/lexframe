@@ -80,9 +80,32 @@ def kind(request):
 @pytest.fixture(scope="session")
 def frame(kind, tmp_path_factory):
     cache = str(tmp_path_factory.mktemp("cache"))
-    return lf.LexFrame(hf_model(kind), tokenizer()).config(cache=cache, progress=False).init(TEXTS)
+    return lf.LexFrame(hf_model(kind), tokenizer()).config(cache=cache, length=128, progress=False).init(TEXTS)
 
 
 def fresh(model, cache=None):
     """A calibrated frame of a model, without a cache by default and without a progress bar."""
-    return lf.LexFrame(model, tokenizer()).config(cache=cache, progress=False).init(TEXTS)
+    return lf.LexFrame(model, tokenizer()).config(cache=cache, length=128, progress=False).init(TEXTS)
+
+
+def top_of(state, k=5):
+    """The k most probable labels (as text) and their probabilities, each [..., k], from a state's logits."""
+    import numpy as np
+
+    m = state._frame._m if hasattr(state, "_frame") else state._lens._m
+    p = torch.softmax(state.logits().float(), -1)
+    t = p.topk(k, -1)
+    ids, probs = t.indices.cpu().numpy(), t.values.cpu().numpy()
+    labels = np.vectorize(lambda i: m.tokenizer.decode([int(i)]), otypes=[object])(ids)
+    return np.where(np.isnan(probs), "", labels), probs
+
+
+def kl_of(state):
+    """The divergence of a state's reading (the softmax of its logits) from the model's own output at its positions, in nats, [...]."""
+    from lexframe._model import kl, logprobs
+
+    m = state._frame._m if hasattr(state, "_frame") else state._lens._m
+    ref = logprobs(m, state._xs[-1][0, state._positions])
+    if state._squeeze[1]:
+        ref = ref[0]
+    return kl(ref, torch.log_softmax(state.logits().float(), -1)).cpu().numpy()

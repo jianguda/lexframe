@@ -1,30 +1,19 @@
-"""The transport of a state through the model's remaining layers, with the context visible or invisible.
+"""The native transport: a state carried through the model's own remaining layers with the true context. Each position attends to
+the true states of its prefix and to its own key (or, jointly, to the carried states of its prefix: the model's own forward pass
+from moved states). The true states are read once per layer as keys and values (the Prefix), which every carried state attends to;
+the positions are independent columns, so only the requested ones are carried.
 
-With the context visible, the native transport carries states through the model's own remaining layers, each position attending to
-the true states of its prefix and to its own key (or, jointly, to the carried states of its prefix: the model's own forward pass from
-moved states).
-
-With the context invisible, the expected transport reads a state by itself: the expectation of the native one over the context's law
-given the state, approximated layer by layer. The state x_k(t) at layer k and position t runs through the model's own layers
-k..L-1 on its own column: norms, feed-forward blocks and residual connections as the model computes them. Each attention write, the
-only place where other positions enter, is replaced by its calibrated prediction from the column's own attention input plus an
-offset for the position, and an independent Gaussian innovation with the calibrated residual covariance:
-
-    a_l = typical_l(u) + offset_l[bucket(t)] + eps_l,    eps_l ~ N(0, Sigma_l).
-
-The reading R_k is the mean next-token distribution over the innovations, integrated by randomised quasi-Monte Carlo: scrambled Sobol
-points on the eigen-coordinates of every Sigma_l, the same points for every layer, position and text, so that a reading is a
-deterministic function of the state and readings of different layers are paired. Position 0 sees only itself, so its attention is
-computed exactly and draws no innovation.
-"""
+The expected transport: a state carried through the remaining layers on its own column, every attention write replaced by its
+expectation given the state (calibrated) plus a Gaussian innovation, averaged by quasi-Monte Carlo: the reading without context."""
 
 from __future__ import annotations
 
 import math
 
 import torch
+from transformers import DynamicCache
 
-from ._model import Model, block, eager, innorm, logits, own_attention
+from ._model import Model, _tree, block, eager, innorm, logits, own_attention
 
 
 def _window(m, k):
@@ -70,6 +59,7 @@ def causal(m, k, n, dev, dt):
 
 
 SUB = 32  # queries per pass of attend()
+PREFIX_FLOATS = 1 << 25  # floats of the copied prefix keys and values of one pass of attend_prefix()
 
 
 def attend(m, k, uq, R=None):
@@ -88,49 +78,109 @@ def attend(m, k, uq, R=None):
     return torch.cat(out)
 
 
-def step(m, k, h, R=None):
-    """Layer k of the native transport on the states h [b, T, d]: each position attends to the reference attention inputs R
-    ([b, T, d], or [1, T, d] shared by every row) of its prefix and to its own key; with R None, to the carried states h of its
-    prefix (the model's own layer)."""
-    b, T, d = h.shape
-    q = innorm(m, k)(h)
-    a = attend(m, k, q, q if R is None else R.expand(b, -1, -1)).reshape(-1, d)
-    return block(m, k, h.reshape(-1, d), lambda u, s: a[s : s + u.shape[0]].to(u.dtype)).view(b, T, d)
+class Prefix:
+    """The context of the native transport: the true states xs [B, T, d] of every position as each layer's attention keys and values,
+    computed once per layer (the model's own key and value projections, position embeddings and norms) and shared by every carried
+    state that attends to them."""
+
+    def __init__(self, m: Model, xs):
+        self.m, self.xs, self.kv = m, xs, {}
+
+    def __call__(self, k: int):
+        if k not in self.kv:
+            m, R = self.m, innorm(self.m, k)(self.xs[k])
+            at = own_attention(m, k)
+            c = DynamicCache()
+            n = R.shape[1]
+            with torch.no_grad(), eager(m):
+                at(hidden_states=R, position_embeddings=m.position_embeddings(k, n), attention_mask=causal(m, k, n, R.device, R.dtype),
+                   past_key_values=c)  # fmt: skip
+            lay = c.layers[at.layer_idx]
+            self.kv[k] = (lay.keys.detach(), lay.values.detach())
+        return self.kv[k]
 
 
-def native(m, xs, LS, X=None, joint=False):
-    """The states of the layers LS < L (or the moved states X, one per layer of LS) carried to the output, [len(LS), B, T, d]:
-    every layer as the model computes it, with each position attending to the true states of its prefix and to its own key (each
-    position on its own column). joint=True carries all positions together, each attending to the carried states of
-    its prefix: the model's own forward pass from the moved states. Unmoved states reproduce the model exactly either way."""
-    L = int(m.n_layers)
-    B, Tn, d = xs[0].shape
-    rd = xs[0][:0].reshape(0, B, Tn, d)
-    for k in range(LS[0], L):
-        if k in LS:
-            x0 = xs[k] if X is None else X[LS.index(k)]
-            rd = torch.cat([rd, x0[None].to(xs[k].dtype)])
-        n = rd.shape[0]
-        R = None if joint else innorm(m, k)(xs[k])[None].expand(n, *xs[k].shape).flatten(0, 1)
-        rd = step(m, k, rd.flatten(0, 1), R).view(n, B, Tn, d)
-    return rd
-
-
-def run(m, xs, LS, X=None, joint=False, chunk=8):
-    """The final states of the native transport of the layers LS, [len(LS), B, T, d] (layer L is the output itself), `chunk` layers
-    per pass; joint=True carries moved states X with each other, as the model's own forward pass does."""
-    L = m.n_layers
-    inner = [l for l in LS if l < L]
+def attend_prefix(m, k, uq, pre: Prefix, P=None):
+    """Layer k's own attention for the queries uq [A, n, d] (attention inputs) at the positions P (default all), each over the keys of
+    its prefix in pre and its own key; row r belongs to text r % B of the prefix's B texts."""
+    at = own_attention(m, k)
+    A, n, _ = uq.shape
+    K, V = pre(k)
+    B, T = K.shape[0], pre.xs[k].shape[1]
+    Pt = torch.arange(T, device=uq.device) if P is None else torch.as_tensor(P, device=uq.device)
+    pe = _tree(lambda t: t.index_select(-2, Pt), m.position_embeddings(k, T))
+    s = torch.arange(T, device=uq.device)
+    see = s[None] < Pt[:, None]
+    w = _window(m, k)
+    if w:
+        see &= Pt[:, None] - s[None] < w
+    am = _additive(torch.cat([see, torch.eye(n, dtype=torch.bool, device=uq.device)], 1), uq.dtype)
+    sub = max(1, PREFIX_FLOATS // (2 * K[0].numel() + 2 * V[0].numel()))
     out = []
-    for c in range(0, len(inner), chunk):
-        Xc = None if X is None else X[c : c + chunk]
-        out.append(native(m, xs, inner[c : c + chunk], Xc, joint=joint))
-    if L in LS:
-        out.append((xs[L] if X is None else X[len(inner)])[None])
+    with eager(m):
+        for a in range(0, A, sub):
+            b = min(A, a + sub) - a
+            if B == 1:
+                Kc, Vc = K.expand(b, *K.shape[1:]), V.expand(b, *V.shape[1:])
+            else:
+                rows = torch.arange(a, a + b, device=uq.device) % B
+                Kc, Vc = K[rows], V[rows]
+            c = DynamicCache()
+            c.update(Kc.to(uq.dtype), Vc.to(uq.dtype), at.layer_idx)
+            out.append(at(hidden_states=uq[a : a + b], position_embeddings=pe, attention_mask=am, past_key_values=c)[0])
     return torch.cat(out)
 
 
-# ---- the expected transport (context invisible)
+def step(m, k, h, pre: Prefix | None = None, P=None):
+    """Layer k of the native transport on the states h [b, n, d]: with pre, each of the positions P (default all) attends to the true
+    states of its prefix and to its own key; without, every position attends to the carried states h of its prefix (the model's own
+    layer, all positions)."""
+    b, n, d = h.shape
+    q = innorm(m, k)(h)
+    a = (attend(m, k, q, q) if pre is None else attend_prefix(m, k, q, pre, P)).reshape(-1, d)
+    return block(m, k, h.reshape(-1, d), lambda u, s: a[s : s + u.shape[0]].to(u.dtype)).view(b, n, d)
+
+
+def native(m, xs, LS, X=None, joint=False, P=None, pre=None):
+    """The states of the layers LS < L (or the moved states X, one per layer of LS) carried to the output, [len(LS), B, T, d]:
+    every layer as the model computes it, with each position attending to the true states of its prefix and to its own key (each
+    position on its own column), only the positions P if given ([len(LS), B, len(P), d]). joint=True carries all positions together,
+    each attending to the carried states of its prefix: the model's own forward pass from the moved states. Unmoved states
+    reproduce the model exactly either way."""
+    if joint and P is not None:
+        raise ValueError("the joint transport carries every position")
+    L = int(m.n_layers)
+    B, Tn, d = xs[0].shape
+    pre = None if joint else (Prefix(m, xs) if pre is None else pre)
+    cols = (lambda x: x) if P is None else (lambda x: x[:, P])
+    n_ = Tn if P is None else len(P)
+    rd = xs[0][:0, :, :n_].reshape(0, B, n_, d)
+    for k in range(LS[0], L):
+        if k in LS:
+            x0 = xs[k] if X is None else X[LS.index(k)]
+            rd = torch.cat([rd, cols(x0)[None].to(xs[k].dtype)])
+        n = rd.shape[0]
+        rd = step(m, k, rd.flatten(0, 1), pre, P).view(n, B, n_, d)
+    return rd
+
+
+def run(m, xs, LS, X=None, joint=False, chunk=8, P=None):
+    """The final states of the native transport of the layers LS, [len(LS), B, T, d] (layer L is the output itself), `chunk` layers
+    per pass, only the positions P if given; joint=True carries moved states X with each other, as the model's own forward pass does."""
+    L = m.n_layers
+    inner = [l for l in LS if l < L]
+    pre = None if joint else Prefix(m, xs)
+    out = []
+    for c in range(0, len(inner), chunk):
+        Xc = None if X is None else X[c : c + chunk]
+        out.append(native(m, xs, inner[c : c + chunk], Xc, joint=joint, P=P, pre=pre))
+    if L in LS:
+        x = xs[L] if X is None else X[len(inner)]
+        out.append((x if P is None else x[:, P])[None])
+    return torch.cat(out)
+
+
+# ---- the expected transport
 
 NB = 16  # position buckets: 0..7 one each, then doubling widths (8..15, 16..31, ...)
 SOBOL = 21201  # the largest dimension of torch's Sobol engine; further coordinates are pseudo-random
@@ -169,12 +219,33 @@ def innovations(fac: torch.Tensor, xi: torch.Tensor, device) -> torch.Tensor:
 SLAB = 1 << 26  # floats of one slice of the softmax over the vocabulary
 
 
+def expected_write(m, cal, l, rb, rm, first, some, eps):
+    """Layer l's attention write in the expected transport, for rows with position buckets rb, integration points rm and the
+    position-0 mask first (some: whether any row is at position 0), the rows repeating with period len(rb): the typical write plus
+    the offset and the innovation, or the exact attention at position 0."""
+    dev = m.device
+    rows = rb.shape[0]
+    add = cal.off[l].to(dev)[rb] + eps[:, l][rm]
+    typ = cal.typical(l)
+
+    def fn(u, s):
+        r = torch.arange(s, s + u.shape[0], device=dev) % rows
+        a = typ(u, s).float() + add[r]
+        if some:
+            own = first[r]
+            if bool(own.any()):
+                a = a.clone()
+                a[own] = attend(m, l, u[own][:, None])[:, 0].float()
+        return a.to(u.dtype)
+
+    return fn
+
+
 def read_expected(m: Model, cal, X: dict, t: torch.Tensor, eps: torch.Tensor, tokens: torch.Tensor | None = None,
                   center: bool = True):  # fmt: skip
-    """Readings with the context invisible (the expected transport) of the states X {layer k < L: [N, hidden]} at the positions t [N], integrated over the innovations eps
-    [M, layer, hidden]: {k: log R_k [N, vocab]}, or with `tokens`
-    log R_k of those tokens [N, token], centred by the mean over the vocabulary unless center=False. Differentiable when grad is
-    enabled."""
+    """Readings with the context invisible (the expected transport) of the states X {layer k < L: [N, hidden]} at the positions t
+    [N], integrated over the innovations eps [M, layer, hidden]: {k: log R_k [N, vocab]}, or with `tokens` log R_k of those tokens
+    [N, token], centred by the mean over the vocabulary unless center=False. Differentiable when grad is enabled."""
     L, dev = m.n_layers, m.device
     M, N = eps.shape[0], t.shape[0]
     ks = sorted(X)
@@ -183,24 +254,13 @@ def read_expected(m: Model, cal, X: dict, t: torch.Tensor, eps: torch.Tensor, to
     rb = buckets(t.to(dev)).repeat_interleave(M)
     rm = torch.arange(M, device=dev).repeat(N)
     first = rt == 0
+    some = bool(first.any())  # once here, not at every layer: each would wait for the device
     H = None
     for l in range(ks[0], L):
         if l in X:
             h = X[l].repeat_interleave(M, 0)
             H = h if H is None else torch.cat([H, h])
-        add = cal.off[l].to(dev)[rb] + eps[:, l][rm]
-        typ = cal.typical(l)
-
-        def fn(u, s, typ=typ, add=add, l=l):
-            r = torch.arange(s, s + u.shape[0], device=dev) % rows
-            a = typ(u, s).float() + add[r]
-            own = first[r]
-            if bool(own.any()):
-                a = a.clone()
-                a[own] = attend(m, l, u[own][:, None])[:, 0].float()
-            return a.to(u.dtype)
-
-        H = block(m, l, H, fn)
+        H = block(m, l, H, expected_write(m, cal, l, rb, rm, first, some, eps))
     out = {}
     V = m.lm_head.weight.shape[0]
     step = max(1, SLAB // (M * V))  # states per slice of the softmax

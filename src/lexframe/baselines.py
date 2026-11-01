@@ -3,16 +3,16 @@ implementation (github.com/anthropics/jacobian-lens) defines it. They are kept a
 
     from lexframe.baselines import JacobianLens, LogitLens
 
-    LogitLens(model, tokenizer).state(text)[layer].decode().top(5)
-    JacobianLens(model, tokenizer).fit(texts).state(text)[layer].decode().top(5)
+    LogitLens(model, tokenizer).state(text)[layer].logits()
+    JacobianLens(model, tokenizer).fit(texts).state(text)[layer].logits()
 
 A lens reads every hidden state of a layer with one map: the logit lens with the output head, the Jacobian lens with
 lm_head(final_norm(J_l x_l)) for the input x_l of block l. J_l is the gradient of the last block's output, summed over
 the target positions, with respect to x_l at a source position, averaged over the source positions and then over the
 fitting sequences. Positions before SKIP and the last position are left out, and a sequence starts with the
-tokenizer's BOS token when it has one. The embedding x_0 has no Jacobian lens, so its decoding holds "" and NaN.
-state() reads a text as given, without BOS, like a frame. A lens state decodes (top labels, centred logits, divergence) and gives
-gradients, indexed like a frame's State, but it has no directions and cannot steer."""
+tokenizer's BOS token when it has one. J_0 is the gradient with respect to the embedding, the input of block 0.
+state() reads a text as given, without BOS, like a frame. A lens state gives centred logits and gradients, indexed like a frame's
+State, but it has no bases and cannot steer."""
 
 from __future__ import annotations
 
@@ -20,11 +20,10 @@ import hashlib
 import os
 from typing import Iterable, Sequence
 
-import numpy as np
 import torch
 
 from ._frame import Label, Text, fingerprint, select
-from ._model import Model, forward, kl, label_id, logprobs, wrap
+from ._model import Model, final, forward, head, label_id, wrap
 
 SKIP = 16
 LENGTH = 128  # tokens per fitting sequence
@@ -42,14 +41,14 @@ def _sequences(m: Model, texts: Iterable[str], limit: int = 100) -> list[torch.T
 
 
 def _jacobian(m: Model, ids: torch.Tensor, valid: torch.Tensor, dim_batch: int) -> torch.Tensor:
-    """J_l of one sequence for l = 1..L-1: [L-1, hidden, hidden]."""
+    """J_l of one sequence for l = 0..L-1: [L, hidden, hidden]."""
     L, d = m.n_layers, m.hidden_dim
     src, out, hooks = {}, [], []
-    for k in range(1, L):
+    for k in range(L):
 
         def pre(_m, args, kwargs, k=k):
             x = args[0] if args else kwargs["hidden_states"]
-            if k == 1:
+            if k == 0:
                 x = x.detach().requires_grad_(True)
                 args, kwargs = ((x, *args[1:]), kwargs) if args else (args, {**kwargs, "hidden_states": x})
             src[k] = x
@@ -57,11 +56,11 @@ def _jacobian(m: Model, ids: torch.Tensor, valid: torch.Tensor, dim_batch: int) 
 
         hooks.append(m.layers[k].register_forward_pre_hook(pre, with_kwargs=True))
     hooks.append(m.layers[-1].register_forward_hook(lambda _m, _i, o: out.append(o[0] if isinstance(o, tuple) else o)))
-    rows = torch.zeros(L - 1, d, d)
+    rows = torch.zeros(L, d, d)
     try:
         with torch.enable_grad():
             m.backbone(input_ids=ids.expand(dim_batch, -1).to(m.device), use_cache=False, return_dict=True)
-            target, sources = out[0], [src[k] for k in range(1, L)]
+            target, sources = out[0], [src[k] for k in range(L)]
             b = torch.arange(dim_batch, device=target.device)[:, None]
             pos = valid.to(target.device)[None]
             for start in range(0, d, dim_batch):
@@ -78,11 +77,11 @@ def _jacobian(m: Model, ids: torch.Tensor, valid: torch.Tensor, dim_batch: int) 
 
 
 def _fit_jacobian(m: Model, seqs: list[torch.Tensor]) -> torch.Tensor:
-    """The Jacobian lens J_l for l = 0..L-1, [L, hidden, hidden], with J_0 undefined (NaN)."""
+    """The Jacobian lens J_l for l = 0..L-1, [L, hidden, hidden]."""
     from tqdm.auto import tqdm
 
     L, d = m.n_layers, m.hidden_dim
-    total, n = torch.zeros(L - 1, d, d), 0
+    total, n = torch.zeros(L, d, d), 0
     for ids in tqdm(seqs, desc="Jacobian lens", leave=False):
         valid = torch.arange(SKIP, ids.shape[1] - 1)
         if valid.numel() == 0:
@@ -91,53 +90,13 @@ def _fit_jacobian(m: Model, seqs: list[torch.Tensor]) -> torch.Tensor:
         n += 1
     if n == 0:
         raise ValueError(f"the Jacobian lens needs sequences longer than {SKIP + 1} tokens")
-    return torch.cat([torch.full((1, d, d), float("nan")), total / n])
-
-
-class LensDecoding:
-    """What a lens decodes from the selected states: top(k) (labels and probabilities, each [..., k]), logits(labels) [..., label]
-    and kl [...], as for a frame's Decoding; "" and NaN at a layer the lens does not read."""
-
-    def __init__(self, state):
-        self._s, self._top = state, None
-
-    def top(self, k: int = 5):
-        if self._top is None or self._top[0] < k:
-            s = self._s
-            m = s._lens._m
-            ref = logprobs(m, s._xs[-1][0, s._positions])
-            ids, probs, kls = [], [], []
-            for l in s._layers:
-                h = s._lens._map(l, s._xs[l][0, s._positions])
-                if h is None:
-                    ids.append(torch.full((len(s._positions), k), -1, dtype=torch.long))
-                    probs.append(torch.full((len(s._positions), k), float("nan")))
-                    kls.append(torch.full((len(s._positions),), float("nan")))
-                    continue
-                lp = logprobs(m, h)
-                t = lp.topk(k, -1)
-                ids.append(t.indices.cpu()), probs.append(t.values.exp().cpu()), kls.append(kl(ref, lp).cpu())
-            ids, probs, kls = (torch.stack(o).numpy() for o in (ids, probs, kls))
-            tok = m.tokenizer
-            labels = ids if tok is None else np.vectorize(lambda i: tok.decode([int(i)]) if i >= 0 else "", otypes=[object])(ids)
-            self._top = (k, labels, probs, kls)
-        _, labels, probs, _ = self._top
-        return self._s._shape(labels[..., :k]), self._s._shape(probs[..., :k])
-
-    def logits(self, labels: Sequence[Label]) -> torch.Tensor:
-        return self._s._lens._directions(self._s, labels, "logits")
-
-    @property
-    def kl(self) -> np.ndarray:
-        if self._top is None:
-            self.top(1)
-        return self._s._shape(self._top[3])
+    return total / n
 
 
 class LensState:
     """The hidden states of a text as a lens reads them, indexed like a frame's State: s[layer] or s[layer, position]. vector,
-    layers and positions as for a State; decode() gives the lens's decoding, gradient(labels) the gradient of the labels' centred
-    logits with respect to the states."""
+    layers and positions as for a State; logits(labels=None) the lens's centred logits,
+    gradient(labels) the gradient of the labels' centred logits with respect to the states."""
 
     def __init__(self, lens, ids, xs, layers, positions, squeeze=(False, False)):
         self._lens, self._ids, self._xs = lens, ids, xs
@@ -169,15 +128,11 @@ class LensState:
     def vector(self) -> torch.Tensor:
         return self._shape(torch.stack([self._xs[l][0, self._positions] for l in self._layers]).float())
 
-    def decode(self, context: bool = False) -> LensDecoding:
-        """The lens's decoding of the states. A lens reads every state by itself, so context must be False (as for a frame's
-        State.decode(context=False))."""
-        if context:
-            raise ValueError("a lens reads every state by itself: it has no decoding with context")
-        return LensDecoding(self)
+    def logits(self, labels: Sequence[Label] | None = None) -> torch.Tensor:
+        return self._lens._directions(self, labels, "logits")
 
     def gradient(self, labels: Sequence[Label]) -> torch.Tensor:
-        return self._lens._directions(self, labels, "coframe")
+        return self._lens._directions(self, labels, "gradient")
 
     def _shape(self, a):
         if self._squeeze[1]:
@@ -204,8 +159,8 @@ class _Lens:
     def __repr__(self) -> str:
         return f"{type(self).__name__}(model={type(self._m.hf).__name__}, layers={self._m.n_layers})"
 
-    def _map(self, layer: int, h: torch.Tensor) -> torch.Tensor | None:
-        """The state of `layer` as the lens hands it to the output head, or None where it does not read the layer."""
+    def _map(self, layer: int, h: torch.Tensor) -> torch.Tensor:
+        """The state of `layer` as the lens hands it to the output head."""
         return h
 
     def _ready(self) -> None:
@@ -223,19 +178,22 @@ class _Lens:
         return LensState(self, ids, xs + [hL], list(range(L + 1)), list(range(ids.shape[1])))
 
     def _directions(self, s: LensState, labels, kind) -> torch.Tensor:
-        vs = torch.tensor([label_id(self._m, t) for t in labels], device=self._m.device)
         W = self._m.lm_head.weight  # no float32 copy of the head
-        Wc = W[vs].float() - W.mean(0, dtype=torch.float32)
+        if labels is None:  # the whole vocabulary, through the head itself
+            vs, Wc = torch.arange(W.shape[0], device=self._m.device), None
+        else:
+            vs = torch.tensor([label_id(self._m, t) for t in labels], device=self._m.device)
+            Wc = W[vs].float() - W.mean(0, dtype=torch.float32)
         out = []
         for l in s._layers:
-            h = s._xs[l][0, s._positions].to(self._m.device).float().clone().requires_grad_(kind == "coframe")
+            h = s._xs[l][0, s._positions].to(self._m.device).float().clone().requires_grad_(kind == "gradient")
             with torch.enable_grad():
-                g = self._map(l, h.to(s._xs[l].dtype))
-                if g is None:
-                    shape = (*h.shape[:-1], len(vs)) + ((h.shape[-1],) if kind == "coframe" else ())
-                    out.append(torch.full(shape, float("nan"), device=h.device))
-                    continue
-                z = self._m.final_norm(g.to(self._m.lm_head.weight.dtype)).float() * self._m.output_scale @ Wc.T
+                x = final(self._m, self._map(l, h.to(s._xs[l].dtype)))  # the readout in float32, as a frame's
+                if Wc is None:
+                    z = head(self._m, x)
+                    z = z - z.mean(-1, keepdim=True)
+                else:
+                    z = (x * self._m.output_scale) @ Wc.T
                 if kind == "logits":
                     out.append(z.detach())
                     continue
@@ -263,7 +221,7 @@ class JacobianLens(_Lens):
     def fit(self, texts: Iterable, size: int = 100) -> JacobianLens:
         """Fit J_l on `size` sequences of 128 tokens of unlabelled `texts`, or on given token ids (one sequence per
         row, used as given). The lens is kept in half precision, as the reference keeps it, and cached on disk in the
-        folder of a frame's calibrations ($LEXFRAME_CACHE or ~/.cache/lexframe)."""
+        frame's cache folder ($LEXFRAME_CACHE or ~/.cache/lexframe)."""
         texts = list(texts)
         if texts and isinstance(texts[0], torch.Tensor):
             seqs = [row[None].long() for t in texts for row in t.reshape(-1, t.shape[-1])][:size]
@@ -271,7 +229,7 @@ class JacobianLens(_Lens):
             seqs = _sequences(self._m, texts, limit=size)
         folder = os.environ.get("LEXFRAME_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "lexframe")
         shapes = hashlib.sha256("|".join(str(tuple(s_.shape)) for s_ in seqs).encode()).hexdigest()[:8]
-        path = os.path.join(folder, "jlens-" + fingerprint(self._m, seqs) + shapes + ".pt")
+        path = os.path.join(folder, "jlens0-" + fingerprint(self._m, seqs) + shapes + ".pt")  # jlens0: with J_0
         if os.path.exists(path):
             J = torch.load(path, map_location="cpu", weights_only=True)
         else:
@@ -285,9 +243,7 @@ class JacobianLens(_Lens):
         if self.jacobian is None:
             raise RuntimeError("call fit(texts) first")
 
-    def _map(self, layer: int, h: torch.Tensor) -> torch.Tensor | None:
-        if layer == 0:
-            return None
+    def _map(self, layer: int, h: torch.Tensor) -> torch.Tensor:
         if layer == self._m.n_layers:
             return h
         return (h.float() @ self.jacobian[layer].to(h.device).float().T).to(h.dtype)

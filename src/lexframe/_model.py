@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -26,8 +27,8 @@ class Model:
     final_norm: Any
     lm_head: Any
     output_scale: float
-    softcap: float | None = None
     pe: dict = field(default_factory=dict)  # per layer, by (length, twice); see position_embeddings()
+    out: dict = field(default_factory=dict)  # the final norm in float32 (see final()); cleared when the head or the norm change
 
     def __repr__(self) -> str:
         return (
@@ -144,7 +145,6 @@ def wrap(hf, tokenizer=None) -> Model:
         body.norm,
         hf.get_output_embeddings(),
         1.0 / float(scale),
-        getattr(cfg, "final_logit_softcapping", None),
     )
 
 
@@ -245,9 +245,41 @@ def block(m: Model, k: int, x: torch.Tensor, read: Callable) -> torch.Tensor:
     return out[0] if len(out) == 1 else torch.cat(out)
 
 
+HEAD_ROWS = 1 << 14  # rows of the output head cast to float32 at once
+
+
+def final(m: Model, h: torch.Tensor) -> torch.Tensor:
+    """The final norm's output, in float32: the body runs in the model's precision, its readout in float32."""
+    norm = m.final_norm
+    if any(p.dtype != torch.float32 for p in getattr(norm, "parameters", lambda: [])()):
+        if "norm" not in m.out:
+            m.out["norm"] = copy.deepcopy(norm).float()
+        norm = m.out["norm"]
+    return norm(h.float()).float()
+
+
+def head(m: Model, nu: torch.Tensor) -> torch.Tensor:
+    """The logits of the final norm's output nu (float32) [..., hidden] -> [..., vocabulary], in float32, the head's rows cast in
+    blocks (no float32 copy of the head)."""
+    W, b = m.lm_head.weight, getattr(m.lm_head, "bias", None)
+    nu = nu.float()
+    if W.dtype == torch.float32:
+        z = torch.nn.functional.linear(nu, W, b)
+    else:
+        z = torch.cat([nu @ W[i : i + HEAD_ROWS].float().T for i in range(0, W.shape[0], HEAD_ROWS)], -1)
+        if b is not None:
+            z = z + b.float()
+    return z * m.output_scale  # before any soft cap: the cap is the softmax's to apply
+
+
+def times_head(m: Model, a: torch.Tensor) -> torch.Tensor:
+    """a [..., vocabulary] times the head's rows, a^T W [..., hidden], in float32 in row blocks."""
+    W = m.lm_head.weight
+    return sum(a[..., i : i + HEAD_ROWS].float() @ W[i : i + HEAD_ROWS].float() for i in range(0, W.shape[0], HEAD_ROWS))
+
+
 def logits(m: Model, h: torch.Tensor) -> torch.Tensor:
-    z = (m.lm_head(m.final_norm(h)) * m.output_scale).float()
-    return z if not m.softcap else torch.tanh(z / m.softcap) * m.softcap
+    return head(m, final(m, h))
 
 
 def logprobs(m: Model, h: torch.Tensor) -> torch.Tensor:

@@ -1,6 +1,6 @@
 """A toolkit for interpreting LM residual streams in their native semantics."""
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 from ._frame import LexFrame
 

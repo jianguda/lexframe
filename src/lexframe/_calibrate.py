@@ -1,5 +1,5 @@
-"""The statistics of the chart with the context invisible: what the expected transport needs, from one pass of the model over
-unlabelled text and a second for the residuals.
+"""The statistics of the reading without context: what the expected transport needs, from two passes of the model over
+unlabelled text.
 
 Per layer: the typical attention output, a ridge regression of the attention output on its input, with the ridge chosen by the
 MacKay evidence fixed point (started from two-fold cross-validation); the statistics of its residuals, the mean residual
@@ -17,8 +17,10 @@ from ._transport import NB, bucket
 
 RHO = [10 ** (e / 8) for e in range(-56, 25)]  # the cross-validation grid of the relative ridge
 FOLDS = 2  # cross-validation folds of the ridge
-LENGTH = 128  # tokens per calibration sequence
-WINDOW = 400  # texts read from each evenly spaced start to fill one sequence
+LENGTH = 256  # tokens per calibration sequence, by default
+WINDOW = 400  # texts read from each evenly spaced start per 128 tokens of a sequence
+BATCH_TOKENS = 1024  # tokens per batch of the first pass
+GROUP_TOKENS = 4096  # tokens per forward pass of the second pass
 ITERATIONS = 500  # at most, of the evidence fixed point
 
 
@@ -191,18 +193,23 @@ def chunks(m: Model, texts: Iterable[str], length: int = LENGTH, batch: int = 8,
         yield torch.tensor(out)
 
 
-def spread(m: Model, texts: list, size: int) -> list[torch.Tensor]:
-    """`size` blocks of LENGTH tokens, one starting at each of `size` evenly spaced texts (documents joined by EOS, as in
-    chunks()), in batches of 8; contiguous chunks when there are fewer texts than blocks."""
+def spread(m: Model, texts: list, size: int, length: int = LENGTH) -> list[torch.Tensor]:
+    """`size` blocks of `length` tokens, one starting at each of `size` evenly spaced texts (documents joined by EOS, as in
+    chunks()), in batches of about BATCH_TOKENS tokens; contiguous chunks when there are fewer texts than blocks."""
     texts = [t for t in texts if t and t.strip()]
+    batch = max(1, BATCH_TOKENS // length)
     if len(texts) < size:
-        return list(chunks(m, texts, length=LENGTH, limit=size))
-    out = []
-    for j in range(size):
-        s = j * len(texts) // size
-        out += [b for b in chunks(m, texts[s : s + WINDOW], length=LENGTH, batch=1, limit=1)]
-    out = torch.cat(out)
-    return list(out.split(8))
+        out = [b for b in chunks(m, texts, length=length, batch=batch, limit=size)]
+    else:
+        window = WINDOW * max(1, length // 128)
+        rows = []
+        for j in range(size):
+            s = j * len(texts) // size
+            rows += [b for b in chunks(m, texts[s : s + window], length=length, batch=1, limit=1)]
+        out = list(torch.cat(rows).split(batch)) if rows else []
+    if not out:
+        raise ValueError(f"the texts are too short for one calibration sequence of {length} tokens: pass more text or a smaller length")
+    return out
 
 
 def evidence(lam, q, tr, n, rho):
@@ -221,9 +228,24 @@ def evidence(lam, q, tr, n, rho):
     return r, float((lam / (lam + r)).sum())
 
 
+def _regroup(batches: list) -> list:
+    """The batches joined into groups of at most GROUP_TOKENS tokens of sequences of the same length (the statistics are sums over
+    positions)."""
+    out, cur = [], []
+    for b in batches:
+        if cur and (cur[0].shape[1] != b.shape[1] or sum(x.numel() for x in cur) + b.numel() > GROUP_TOKENS):
+            out.append(torch.cat(cur))
+            cur = []
+        cur.append(b)
+    if cur:
+        out.append(torch.cat(cur))
+    return out
+
+
 @torch.no_grad()
-def residuals(m: Model, cal: Calibration, batches, gamma, store) -> tuple:
-    """The statistics of the expected attention write's residuals: offsets [L, bucket, d], factors [L, d, d] and counts [bucket]."""
+def second_pass(m: Model, cal: Calibration, batches, gamma, store) -> tuple:
+    """The second pass over the calibration text: with the typical attention outputs of cal, the statistics of their residuals,
+    offsets [L, bucket, d], factors [L, d, d] and counts [bucket]."""
     L, d, dev = m.n_layers, m.hidden_dim, m.device
     S = torch.zeros(L, d, d, device=dev)
     s = torch.zeros(L, NB, d, device=dev)
@@ -236,22 +258,21 @@ def residuals(m: Model, cal: Calibration, batches, gamma, store) -> tuple:
         r = (a.reshape(-1, d).float() - typ[k](u.reshape(-1, d), 0).float()).view(B, T, d)[:, 1:]
         if T not in idx:
             idx[T] = torch.tensor([bucket(t) for t in range(1, T)], device=dev)
-        b = idx[T]
         S[k] += torch.einsum("btd,bte->de", r, r)
-        s[k].index_add_(0, b, r.sum(0))
+        s[k].index_add_(0, idx[T], r.sum(0))
         if k == 0:
-            c.index_add_(0, b, torch.full((T - 1,), float(B), device=dev))
+            c.index_add_(0, idx[T], torch.full((T - 1,), float(B), device=dev))
 
-    for ids in batches:
-        forward(m, m.ids(ids), on_attention=cap)
+    for ids in _regroup([m.ids(b) for b in batches]):
+        forward(m, ids, on_attention=cap)
     off = s / c.clamp_min(1)[None, :, None]
     for b in range(2, NB):  # buckets beyond the calibration length take the last one seen
         if c[b] == 0:
             off[:, b] = off[:, b - 1]
     fac = torch.empty(L, d, d, device=store)
-    n = float(c.sum())
+    nr = float(c.sum())
     for k in range(L):
-        C = (S[k] - (off[k].T * c) @ off[k]) / n * (n / (n - gamma[k]))
+        C = (S[k] - (off[k].T * c) @ off[k]) / nr * (nr / (nr - gamma[k]))
         lam, V = eigh(C)
         fac[k] = (V * lam.clamp_min(0).sqrt()).float().to(store)
     return off.float(), fac, c.cpu()
@@ -313,7 +334,7 @@ def calibrate(m: Model, batches: Iterable, progress: bool = False) -> Calibratio
         )
         Q[k], QA[k], lam[k], rho[k] = Qk.float().to(store), QAk.float().to(store), ev.float(), rk
     cal = Calibration(ubar, abar, Q, lam, QA, rho, None, None, None, stats, model_id(m))
-    cal.off, cal.fac, cal.count = residuals(m, cal, batches, gamma, store)
+    cal.off, cal.fac, cal.count = second_pass(m, cal, batches, gamma, store)
     for k in range(L):
         stats[k]["residual_count"] = float(cal.count.sum())
     return cal
